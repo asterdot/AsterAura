@@ -4,3 +4,7 @@ dist/
 _test-data/
 *.user
 .vs/
+
+# 本地运行/调试产物（headless 数据目录、日志 dump）
+_run_*/
+*.out

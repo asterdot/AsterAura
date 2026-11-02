@@ -92,7 +92,8 @@ public sealed partial class MoodService : IMoodService
                     JsonUtil.Num(saved["cortisol"], 20),
                     JsonUtil.Num(saved["serotonin"], 50)),
                     JsonUtil.Str(saved["reason"], ""));
-                if (saved["history"] is JsonArray hist) _state["history"] = hist;
+                // DeepClone：hist 还挂在 saved 上，直接赋给 _state 会触发「node already has a parent」
+                if (saved["history"] is JsonArray hist) _state["history"] = hist.DeepClone();
             }
         }
     }

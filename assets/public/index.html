@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>AuraChat</title>
+  <link rel="icon" id="favicon" href="icon.svg" />
+  <link rel="stylesheet" href="app.css" />
+</head>
+<body>
+  <div id="gate" class="gate hidden">
+    <div class="gate-card">
+      <div class="gate-logo" id="gate-logo"></div>
+      <h1 id="gate-title">AuraChat</h1>
+      <p id="gate-sub" class="muted"></p>
+
+      <form id="wizard" class="wizard hidden" autocomplete="off">
+        <div class="w-step" data-step="1">
+          <h2>给 Ta 起个名字</h2>
+          <input id="w-name" type="text" placeholder="名字（默认跟随人设）" maxlength="40" />
+          <input id="w-tag" type="text" placeholder="个性签名（可留空）" maxlength="60" />
+          <div class="w-nav">
+            <span></span>
+            <button type="button" class="primary" data-next>下一步</button>
+          </div>
+        </div>
+
+        <div class="w-step hidden" data-step="2">
+          <h2>Ta 该怎么称呼你</h2>
+          <input id="w-owner" type="text" placeholder="比如「主人」「宝贝」「你」" maxlength="40" />
+          <div class="w-nav">
+            <button type="button" class="ghost" data-prev>上一步</button>
+            <button type="button" class="primary" data-next>下一步</button>
+          </div>
+        </div>
+
+        <div class="w-step hidden" data-step="3">
+          <h2>挑个人设，再给 Ta 一张脸</h2>
+          <div class="w-persona-list" id="w-persona-list"></div>
+          <div class="w-persona-new hidden" id="w-persona-new">
+            <div class="w-field"><label class="w-label" for="w-pn-name">Ta 叫什么</label>
+              <input id="w-pn-name" type="text" placeholder="名字，显示在聊天里" maxlength="30" /></div>
+            <div class="w-field"><label class="w-label" for="w-pn-tags">几个标签</label>
+              <input id="w-pn-tags" type="text" placeholder="用空格或逗号隔开，例如 冷淡 毒舌 慢热" maxlength="80" /></div>
+            <div class="w-field"><label class="w-label" for="w-pn-body">Ta 是什么样的人</label>
+              <textarea id="w-pn-body" rows="4" placeholder="说人话就行：性格、说话的口气、喜欢什么、不喜欢什么。"></textarea></div>
+          </div>
+          <div class="w-avatar">
+            <div class="w-avatar-preview" id="w-avatar-preview"></div>
+            <div class="w-avatar-actions">
+              <label class="file-btn">选张图<input type="file" id="w-avatar" accept="image/*" hidden /></label>
+              <button type="button" class="ghost" id="w-avatar-clear">用默认图标</button>
+            </div>
+          </div>
+          <p class="hint">头像可在设置进行更换</p>
+          <div class="w-nav">
+            <button type="button" class="ghost" data-prev>上一步</button>
+            <button type="button" class="primary" data-next>下一步</button>
+          </div>
+        </div>
+
+        <div class="w-step hidden" data-step="4">
+          <h2>选个模型</h2>
+          <div class="w-field">
+            <span class="w-label">模型</span>
+            <select id="w-model"></select>
+          </div>
+          <div class="w-field">
+            <span class="w-label">思考强度</span>
+            <select id="w-effort">
+              <option value="off">关</option>
+              <option value="low" selected>低</option>
+              <option value="medium">中</option>
+              <option value="high">高</option>
+            </select>
+          </div>
+          <p class="hint" id="w-model-hint">模型由 DSH 接入，可在设置进行更换</p>
+          <div class="w-nav">
+            <button type="button" class="ghost" data-prev>上一步</button>
+            <button type="button" class="primary" data-next>下一步</button>
+          </div>
+        </div>
+
+        <div class="w-step hidden" data-step="5">
+          <h2>设个主人账号</h2>
+          <input id="w-username" type="text" placeholder="用户名（区分大小写）" autocomplete="username" />
+          <input id="w-password" type="password" placeholder="密码（至少 6 位）" autocomplete="new-password" />
+          <p class="gate-msg" id="wizard-msg"></p>
+          <div class="w-nav">
+            <button type="button" class="ghost" data-prev>上一步</button>
+            <button type="submit" class="primary">完成</button>
+          </div>
+        </div>
+      </form>
+
+      <form id="gate-form" class="hidden" autocomplete="off">
+        <p id="gate-hello" class="muted"></p>
+        <input id="g-username" type="text" placeholder="用户名（区分大小写）" autocomplete="username" />
+        <input id="g-password" type="password" placeholder="密码" autocomplete="current-password" />
+        <button id="g-submit" type="submit" class="primary">登录</button>
+        <p class="gate-msg" id="gate-msg"></p>
+      </form>
+    </div>
+  </div>
+
+  <div id="app" class="app hidden">
+    <aside class="rail">
+      <div class="rail-avatar" id="rail-avatar"></div>
+      <nav id="nav" class="rail-nav"></nav>
+    </aside>
+    <main id="main" class="main"></main>
+  </div>
+
+  <div id="toasts" class="toasts"></div>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

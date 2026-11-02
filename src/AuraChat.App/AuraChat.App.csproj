@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <AssemblyName>AuraChat</AssemblyName>
+    <RootNamespace>AuraChat.App</RootNamespace>
+    <Version>2.0.0</Version>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <!-- 只借 WinForms 的托盘图标；WFO0003 不适用 -->
+    <NoWarn>$(NoWarn);WFO0003</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- WinForms 的全局 using 会和 WPF 的 Brush/KeyEventArgs 撞名 -->
+    <Using Remove="System.Windows.Forms" />
+    <Using Remove="System.Drawing" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\AuraChat.Server\AuraChat.Server.csproj" />
+  </ItemGroup>
+
+  <!-- 网页端 UI 随 exe 一起发布：assets/public/** 拷到输出目录 public/ -->
+  <ItemGroup>
+    <None Include="..\..\assets\public\**\*" LinkBase="public" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\assets\personas\**\*" LinkBase="personas" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.4314.35" />
+  </ItemGroup>
+
+</Project>

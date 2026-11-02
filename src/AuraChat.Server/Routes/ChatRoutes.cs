@@ -1,0 +1,236 @@
+using System.Text.Json.Nodes;
+using AuraChat.Core.Features;
+using AuraChat.Core.Media;
+
+namespace AuraChat.Server.Routes;
+
+/// <summary>聊天（对齐原 web/routes/chat.js 的 4 条接口）。</summary>
+[RouteModule(30)]
+public static class ChatRoutes
+{
+    public static void Register(Router r, ApiContext api)
+    {
+        // ---------- 拉历史 ----------
+        r.Add("GET", "api/messages", async call =>
+        {
+            var me = await api.RequireUserAsync(call);
+            if (me is null) return;
+            var history = api.Get<IHistoryStore>();
+            if (history is null) { await HttpUtil.Fail(call.Http, "聊天记录没装上"); return; }
+
+            var chatId = ApiContext.ChatIdOf(me.Subject);
+            var file = HttpUtil.Query(call.Http, "file") ?? "";
+            var before = ParseLong(HttpUtil.Query(call.Http, "before"));
+
+            if (file is "last" or "prev")
+            {
+                var (messages, oldestAt, hasMore, index, total, fileId) = history.PageFile(chatId, file, before);
+                await HttpUtil.JsonAsync(call.Http, new JsonObject
+                {
+                    ["ok"] = true,
+                    ["messages"] = messages,
+                    ["oldestAt"] = oldestAt,
+                    ["hasMore"] = hasMore,
+                    ["file"] = new JsonObject { ["index"] = index, ["total"] = total, ["id"] = fileId },
+                });
+                return;
+            }
+
+            var limit = (int)Math.Clamp(ParseLong(HttpUtil.Query(call.Http, "limit"), 30), 1, 100);
+            var page = history.Page(chatId, before, limit);
+            await HttpUtil.JsonAsync(call.Http, new JsonObject
+            {
+                ["ok"] = true,
+                ["messages"] = page.Messages,
+                ["oldestAt"] = page.OldestAt,
+                ["hasMore"] = page.HasMore,
+                ["segment"] = new JsonObject { ["limit"] = limit },
+            });
+        });
+
+        // ---------- 发言 ----------
+        r.Add("POST", "api/messages", async call =>
+        {
+            var me = await api.RequireUserAsync(call);
+            if (me is null) return;
+            var history = api.Get<IHistoryStore>();
+            var hub = api.Get<IChatHub>();
+            if (history is null) { await HttpUtil.Fail(call.Http, "聊天记录没装上"); return; }
+
+            var b = await HttpUtil.ReadBodyAsync(call.Http);
+            var chatId = ApiContext.ChatIdOf(me.Subject);
+            var text = b["text"]?.ToString() ?? "";
+            var images = b["images"] as JsonArray ?? new JsonArray();
+            var voice = b["voice"] as JsonObject;
+            var sticker = b["sticker"]?.ToString() ?? "";
+            var name = api.Auth.DisplayNameOf(me.Subject);
+
+            if (text.Trim().Length == 0 && images.Count == 0 && voice is null && sticker.Length == 0)
+            {
+                await HttpUtil.Fail(call.Http, "没说啥");
+                return;
+            }
+
+            var media = api.Get<MediaStore>();
+            var appended = 0;
+
+            // 语音条
+            if (voice is not null && !string.IsNullOrEmpty(voice["data"]?.ToString()))
+            {
+                var bytes = HttpUtil.Base64ToBytes(voice["data"]!.ToString());
+                var mime = voice["mime"]?.ToString() ?? "audio/webm";
+                var dur = (int)Math.Round(AuraChat.Core.JsonUtil.Num(voice["dur"], 0));
+                var (mediaId, size) = media!.Save(chatId, bytes, mime);
+                var saved = history.Append(chatId, new JsonObject
+                {
+                    ["who"] = "user",
+                    ["uid"] = me.Subject,
+                    ["text"] = $"[语音 · {dur}秒]",
+                    ["kind"] = "voice",
+                    ["mediaId"] = mediaId,
+                    ["mediaMime"] = mime,
+                    ["bytes"] = size,
+                    ["dur"] = dur,
+                });
+                api.Emit("message", new JsonObject { ["chatId"] = chatId, ["message"] = saved.DeepClone() });
+                appended++;
+            }
+            else if (sticker.Length > 0)
+            {
+                var stickers = api.Get<IStickerService>();
+                var name2 = "";
+                if (stickers is not null)
+                {
+                    var list = await stickers.ListAsync();
+                    foreach (var item in list["items"] as JsonArray ?? new JsonArray())
+                    {
+                        if (item?["md5"]?.ToString() == sticker) { name2 = item["name"]?.ToString() ?? ""; break; }
+                    }
+                }
+                var savedSticker = history.Append(chatId, new JsonObject
+                {
+                    ["who"] = "user",
+                    ["uid"] = me.Subject,
+                    ["text"] = "[表情]",
+                    ["kind"] = "sticker",
+                    ["sticker"] = sticker,
+                    ["name"] = name2,
+                    ["mark"] = "user-sticker",
+                });
+                api.Emit("message", new JsonObject { ["chatId"] = chatId, ["message"] = savedSticker.DeepClone() });
+                appended++;
+            }
+            else if (text.Trim().Length > 0)
+            {
+                var savedText = history.Append(chatId, new JsonObject
+                {
+                    ["who"] = "user",
+                    ["uid"] = me.Subject,
+                    ["text"] = text,
+                    ["kind"] = "text",
+                });
+                api.Emit("message", new JsonObject { ["chatId"] = chatId, ["message"] = savedText.DeepClone() });
+                appended++;
+            }
+
+            // 图片（可多张）
+            foreach (var img in images)
+            {
+                if (img is not JsonObject io) continue;
+                var data = HttpUtil.StripDataUrl(io["data"]?.ToString());
+                if (string.IsNullOrEmpty(data)) continue;
+                var mime = io["mediaType"]?.ToString() ?? "image/png";
+                var (mediaId, size) = media!.Save(chatId, Convert.FromBase64String(data), mime);
+                var savedImage = history.Append(chatId, new JsonObject
+                {
+                    ["who"] = "user",
+                    ["uid"] = me.Subject,
+                    ["text"] = "[图片]",
+                    ["kind"] = "image",
+                    ["mediaId"] = mediaId,
+                    ["mediaMime"] = mime,
+                    ["bytes"] = size,
+                    ["mark"] = "user-image",
+                });
+                api.Emit("message", new JsonObject { ["chatId"] = chatId, ["message"] = savedImage.DeepClone() });
+                appended++;
+            }
+
+            if (appended == 0) { await HttpUtil.Fail(call.Http, "没说啥"); return; }
+
+            history.Touch(chatId);
+
+            var message = new UserMessage(chatId, me.Subject, name, text, images, voice is null ? null : new VoiceInput(voice["data"]?.ToString() ?? "", voice["mime"]?.ToString() ?? "audio/webm", AuraChat.Core.JsonUtil.Num(voice["dur"], 0)), sticker);
+            if (hub is not null)
+            {
+                _ = Task.Run(async () =>
+                {
+                    try { await hub.OnUserMessageAsync(message); }
+                    catch (Exception ex) { api.Log.Error("处理消息出错：" + ex.Message); }
+                });
+            }
+
+            await HttpUtil.JsonAsync(call.Http, new JsonObject { ["ok"] = true });
+        });
+
+        // ---------- 只发语音 ----------
+        r.Add("POST", "api/voice", async call =>
+        {
+            var me = await api.RequireUserAsync(call);
+            if (me is null) return;
+            var history = api.Get<IHistoryStore>();
+            var hub = api.Get<IChatHub>();
+            var media = api.Get<MediaStore>();
+            if (history is null || media is null) { await HttpUtil.Fail(call.Http, "聊天记录没装上"); return; }
+
+            var b = await HttpUtil.ReadBodyAsync(call.Http);
+            var data = HttpUtil.StripDataUrl(b["data"]?.ToString());
+            if (string.IsNullOrEmpty(data)) { await HttpUtil.Fail(call.Http, "没说啥"); return; }
+
+            var dur = (int)Math.Round(AuraChat.Core.JsonUtil.Num(b["dur"], 0));
+            if (dur < 1 || dur > 60) { await HttpUtil.Fail(call.Http, "语音条要 1 到 60 秒"); return; }
+
+            var mime = b["mime"]?.ToString() ?? "audio/webm";
+            var chatId = ApiContext.ChatIdOf(me.Subject);
+            var (mediaId, size) = media.Save(chatId, Convert.FromBase64String(data), mime);
+            var savedVoice = history.Append(chatId, new JsonObject
+            {
+                ["who"] = "user",
+                ["uid"] = me.Subject,
+                ["text"] = $"[语音 · {dur}秒]",
+                ["kind"] = "voice",
+                ["mediaId"] = mediaId,
+                ["mediaMime"] = mime,
+                ["bytes"] = size,
+                ["dur"] = dur,
+            });
+            api.Emit("message", new JsonObject { ["chatId"] = chatId, ["message"] = savedVoice.DeepClone() });
+            history.Touch(chatId);
+
+            if (hub is not null)
+            {
+                var message = new UserMessage(chatId, me.Subject, api.Auth.DisplayNameOf(me.Subject), "", new JsonArray(), new VoiceInput(data, mime, dur), "");
+                _ = Task.Run(async () =>
+                {
+                    try { await hub.OnUserMessageAsync(message); }
+                    catch (Exception ex) { api.Log.Error("处理语音出错：" + ex.Message); }
+                });
+            }
+            await HttpUtil.JsonAsync(call.Http, new JsonObject { ["ok"] = true });
+        });
+
+        // ---------- 正在输入 ----------
+        r.Add("POST", "api/typing", async call =>
+        {
+            var me = await api.RequireUserAsync(call);
+            if (me is null) return;
+            var b = await HttpUtil.ReadBodyAsync(call.Http);
+            var typing = AuraChat.Core.JsonUtil.Bool(b["typing"], false);
+            api.Get<IChatHub>()?.NotifyTyping(ApiContext.ChatIdOf(me.Subject), typing);
+            await HttpUtil.JsonAsync(call.Http, new JsonObject { ["ok"] = true });
+        });
+    }
+
+    private static long ParseLong(string? s, long fallback = 0)
+        => long.TryParse(s, out var v) ? v : fallback;
+}

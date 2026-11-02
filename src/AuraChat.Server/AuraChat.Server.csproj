@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <!-- Kestrel / 静态文件 / SSE 都走 ASP.NET Core 共享框架 -->
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\AuraChat.Core\AuraChat.Core.csproj" />
+    <ProjectReference Include="..\AuraChat.Ai\AuraChat.Ai.csproj" />
+    <ProjectReference Include="..\AuraChat.Features\AuraChat.Features.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -101,6 +101,10 @@ public sealed class Guard
     public GuardOptions Options()
     {
         var model = _host.Text(DefaultModel, "guard", "model");
+        // 旧版 Node 把 guard 指向本机 18080 的小模型代理、model 就写占位名 "guard"；
+        // 迁移成独立进程后那个代理不一定在，占位名也不是真模型 —— 回落到主模型。
+        if (string.IsNullOrWhiteSpace(model) || string.Equals(model, DefaultModel, StringComparison.OrdinalIgnoreCase))
+            model = _host.Text("", "model", "model");
         var prompt = _host.Text(SystemPrompt, "guard", "systemPrompt");
         var top = _host.Int(DefaultTopLogprobs, "guard", "topLogprobs");
         return new GuardOptions(

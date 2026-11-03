@@ -27,7 +27,8 @@ public sealed record Account(
 
 /// <summary>
 /// 认证与会话。文件格式与字段名逐字对齐原 Node 版 web/auth.js（users.json / web-sessions.json），
-/// 迁移时可以直接读旧数据。密码用 PBKDF2-SHA256；旧版 scrypt 哈希标记为 legacy，需要主人重设一次密码。
+/// 迁移时可以直接读旧数据。新密码用 PBKDF2-SHA256；旧版 scrypt 哈希也能直接登录，
+/// 验证通过后自动换成 PBKDF2（见 ScryptKdf）。
 /// </summary>
 public sealed class AuthService(DataStore store, Logging.AppLog log)
 {
@@ -127,8 +128,10 @@ public sealed class AuthService(DataStore store, Logging.AppLog log)
 
             var acc = candidates.FirstOrDefault(a => a is not null && a.Username == username);
             if (acc is null) return (false, "用户名或密码不对", null);
-            if (acc.Algorithm == "scrypt") return (false, "这个账号来自旧版本，需要先在设置里重设一次密码", null);
-            if (!VerifyPassword(password ?? "", acc.Salt, acc.Hash)) return (false, "用户名或密码不对", null);
+            if (!VerifyPassword(password ?? "", acc.Salt, acc.Hash, acc.Algorithm)) return (false, "用户名或密码不对", null);
+            // 旧版 Node 用的是 scrypt，登录成功后顺手升级成 PBKDF2，下次就不用再算慢的
+            if (!string.Equals(acc.Algorithm, "pbkdf2", StringComparison.OrdinalIgnoreCase))
+                UpgradeHash(users, acc, password ?? "");
             return (true, null, acc);
         }
     }
@@ -350,12 +353,27 @@ public sealed class AuthService(DataStore store, Logging.AppLog log)
         return Convert.ToHexString(bytes).ToLowerInvariant();
     }
 
-    private static bool VerifyPassword(string password, string salt, string expectedHex)
+    private static bool VerifyPassword(string password, string salt, string expectedHex, string? algorithm = null)
     {
         if (string.IsNullOrEmpty(salt) || string.IsNullOrEmpty(expectedHex)) return false;
         byte[] expected;
         try { expected = Convert.FromHexString(expectedHex); }
         catch { return false; }
+
+        // 旧版 Node：crypto.scryptSync(pw, salt, 64)，默认 N=16384 / r=8 / p=1
+        if (!string.Equals(algorithm, "pbkdf2", StringComparison.OrdinalIgnoreCase))
+        {
+            try
+            {
+                var legacy = ScryptKdf.Hash(
+                    Encoding.UTF8.GetBytes(password),
+                    Encoding.UTF8.GetBytes(salt),
+                    ScryptKdf.LegacyN, ScryptKdf.LegacyR, ScryptKdf.LegacyP, expected.Length);
+                if (CryptographicOperations.FixedTimeEquals(legacy, expected)) return true;
+            }
+            catch { /* 参数不合法就落到 PBKDF2 再试一次 */ }
+        }
+
         var actual = Rfc2898DeriveBytes.Pbkdf2(
             Encoding.UTF8.GetBytes(password),
             Encoding.UTF8.GetBytes(salt),
@@ -363,6 +381,21 @@ public sealed class AuthService(DataStore store, Logging.AppLog log)
             HashAlgorithmName.SHA256,
             expected.Length);
         return CryptographicOperations.FixedTimeEquals(actual, expected);
+    }
+
+    /// <summary>把旧 scrypt 账号悄悄升级成 PBKDF2（密码本身不变，用户无感）。</summary>
+    private void UpgradeHash(JsonObject users, Account account, string password)
+    {
+        JsonNode? node = account.Role == "owner"
+            ? users["owner"]
+            : GuestsOf(users)?[account.Subject];
+        if (node is not JsonObject record) return;
+        var salt = NewSalt();
+        record["salt"] = salt;
+        record["hash"] = HashPassword(password, salt);
+        record["algorithm"] = "pbkdf2";
+        SaveUsers(users);
+        log.Child("auth").Info($"旧密码哈希已升级为 PBKDF2：{account.Subject}");
     }
 
     private static long Now() => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();

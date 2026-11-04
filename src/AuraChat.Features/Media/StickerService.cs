@@ -295,7 +295,9 @@ public sealed class StickerService : IStickerService
         if (pick is null) return Task.FromResult<string?>(null);
 
         MarkUsed(Md5Of(pick));
-        return Task.FromResult<string?>(FileOf(pick));
+        // #4 断根：对外一律给 md5，不给文件名。历史消息里存的是 sticker 值，
+        // 客户端拿它拼 /api/sticker/<值>；存成 manual-xxxx.jpg 会 404 破图。
+        return Task.FromResult<string?>(Md5Of(pick));
     }
 
     public string? RandomSticker()
@@ -303,7 +305,7 @@ public sealed class StickerService : IStickerService
         var list = Objects(ItemsOf(LoadLibrary())).ToList();
         if (list.Count == 0) return null;
         var item = list[Random.Shared.Next(list.Count)];
-        return FileOf(item);
+        return Md5Of(item);   // #4 断根：同 PickAsync，给 md5 而不是文件名
     }
 
     public Task<JsonObject> ListAsync()

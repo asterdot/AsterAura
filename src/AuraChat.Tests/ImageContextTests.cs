@@ -62,6 +62,41 @@ public class ImageContextTests : IDisposable
     }
 
     [Fact]
+    public void BuildImageParts_WirePayload_DataAndMediaType_ProducesImageUrlContent()
+    {
+        // 端到端契约：网页端 POST /api/messages 发的图片是 {data, mediaType, name}
+        // （assets/public/app.js:637 发送、ChatRoutes.cs:151-153 按同名字段解析落盘）。
+        // 这批对象原样交给 ChatHub，所以 BuildImageParts 必须认得这个形状 —— 认不得模型就永远看不到图。
+        var bytes = new byte[] { 9, 8, 7, 6, 5 };
+        var b64 = Convert.ToBase64String(bytes);
+
+        var parts = ChatHubTestHook.BuildImageParts(_host, _chatId,
+        [
+            new JsonObject { ["data"] = "data:image/png;base64," + b64, ["mediaType"] = "image/png", ["name"] = "photo.png" },
+        ]);
+
+        var part = Assert.Single(parts);
+        Assert.Equal("image_url", (string?)part["type"]);
+        Assert.Equal("data:image/png;base64," + b64, part["image_url"]?["url"]?.ToString());
+    }
+
+    [Fact]
+    public void BuildImageParts_WirePayload_BareBase64_ProducesImageUrlContent()
+    {
+        // 同一形状但不带 data: 前缀的裸 base64（各端上传方式不同，两种都要认）
+        var bytes = new byte[] { 4, 3, 2, 1 };
+        var b64 = Convert.ToBase64String(bytes);
+
+        var parts = ChatHubTestHook.BuildImageParts(_host, _chatId,
+        [
+            new JsonObject { ["data"] = b64, ["mediaType"] = "image/jpeg" },
+        ]);
+
+        var part = Assert.Single(parts);
+        Assert.Equal("data:image/jpeg;base64," + b64, part["image_url"]?["url"]?.ToString());
+    }
+
+    [Fact]
     public void BuildImageParts_MissingMedia_ReturnsNothing()
     {
         var parts = ChatHubTestHook.BuildImageParts(_host, _chatId,

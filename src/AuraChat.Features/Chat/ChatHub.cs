@@ -80,24 +80,32 @@ public sealed class ChatHub : IChatHub
     {
         if (_host.Get<IToolRegistry>() is not { } tools) return;
 
-        tools.Register(ToolSchemas.CheckClock, (_, _) =>
-        {
-            var now = DateTime.Now;
-            var cn = now.ToString("yyyy-MM-dd HH:mm:ss") + " " + "日一二三四五六"[(int)now.DayOfWeek] + "曜日";
-            var hour = now.Hour;
-            var period = hour switch
-            {
-                >= 5 and < 8 => "清晨",
-                < 11 => "上午",
-                < 13 => "中午",
-                < 18 => "下午",
-                < 23 => "晚上",
-                _ => "深夜",
-            };
-            return Task.FromResult($"现在是 {cn}（{period}，{hour} 点）。");
-        });
+        tools.Register(ToolSchemas.CheckClock, (_, _) => Task.FromResult($"现在是 {ClockText(DateTime.Now)}。"));
 
         tools.Register(ToolSchemas.CheckHistory, (args, ct) => CheckHistoryAsync(args, ct));
+    }
+
+    /// <summary>当前时间这一行（进系统提示）：日期 + 星期 + 时刻 + 时段。public 供测试直调。</summary>
+    public static string NowLine(DateTime now) => $"【现在】{ClockText(now)}";
+
+    /// <summary>
+    /// 时间的人话写法：2026-11-04 周三 18:02（晚上，18 点）。
+    /// 系统提示与 check_clock 共用这一份口径，免得两处各写一套。
+    /// </summary>
+    public static string ClockText(DateTime now)
+    {
+        var week = "日一二三四五六"[(int)now.DayOfWeek];
+        var hour = now.Hour;
+        var period = hour switch
+        {
+            >= 5 and < 8 => "清晨",
+            >= 8 and < 11 => "上午",
+            >= 11 and < 13 => "中午",
+            >= 13 and < 18 => "下午",
+            >= 18 and < 23 => "晚上",
+            _ => "深夜",   // 23 点与 0-4 点
+        };
+        return $"{now:yyyy-MM-dd} 周{week} {now:HH:mm}（{period}，{hour} 点）";
     }
 
     /// <summary>回读聊天记录：按关键词/天数/条数查原文，wantImages=true 只翻带图的（表情包场景）。</summary>
@@ -474,6 +482,10 @@ public sealed class ChatHub : IChatHub
         var kind = p.UserId == AuraChatInfo.OwnerId ? "private" : "social";
         parts.Add(PersonaService.RulesText(kind, _host.Config));
 
+        // #3 时间观念：人格卡自己写着「你能感知到…现在几点」，那就把这份感官真正交给她。
+        // 只挂一个 check_clock 工具不够 —— 模型不会每轮都主动去调，于是表现得「没有时间观念」。
+        parts.Add(NowLine(DateTime.Now));
+
         if (Mood is not null)
         {
             try
@@ -574,32 +586,64 @@ public sealed class ChatHub : IChatHub
         return messages;
     }
 
-    /// <summary>把图片转成多模态 content parts（data:image;base64）。文件缺失/读不了的跳过。public 供测试直调。</summary>
+    /// <summary>
+    /// 把图片转成多模态 content parts（data:image;base64）。认两种形状：
+    ///   ① 客户端原始载荷 <c>{data, mediaType}</c> —— 网页端 app.js、Android 端直传 base64，落盘前就是这个形状；
+    ///   ② 已落盘引用 <c>{mediaId, mediaMime}</c> —— 内部/回读场景。
+    /// 只认 ② 会让模型永远收不到图（B1 端到端不通的根因）。文件缺失/读不了的跳过。public 供测试直调。
+    /// </summary>
     public static List<JsonObject> BuildImagePartsForTest(FeatureHost host, string chatId, List<JsonObject> images)
     {
         var parts = new List<JsonObject>();
         var media = host.Get<MediaStore>();
-        if (media is null) return parts;
         foreach (var img in images)
         {
-            var mediaId = img["mediaId"]?.ToString() ?? "";
-            var mime = img["mediaMime"]?.ToString() ?? "image/png";
-            if (mediaId.Length == 0) continue;
-            try
+            var mime = img["mediaMime"]?.ToString() ?? img["mediaType"]?.ToString() ?? "image/png";
+            if (mime.Length == 0) mime = "image/png";
+
+            byte[]? bytes = null;
+
+            // ① 客户端原始载荷：data 可以是 "data:image/png;base64,xxx"，也可以是裸 base64
+            var raw = img["data"]?.ToString() ?? "";
+            if (raw.Length > 0)
             {
-                var path = media.PathOf(chatId, mediaId);
-                if (path is null) continue;
-                var bytes = File.ReadAllBytes(path);
-                parts.Add(new JsonObject
-                {
-                    ["type"] = "image_url",
-                    ["image_url"] = new JsonObject
-                    {
-                        ["url"] = $"data:{mime};base64,{Convert.ToBase64String(bytes)}",
-                    },
-                });
+                var comma = raw.IndexOf(',');
+                var b64 = raw.StartsWith("data:", StringComparison.OrdinalIgnoreCase) && comma >= 0
+                    ? raw[(comma + 1)..]
+                    : raw;
+                try { bytes = Convert.FromBase64String(b64); } catch { bytes = null; }
             }
-            catch { /* 单张图读不了不影响其余 */ }
+
+            // ② 已落盘的 mediaId 引用
+            if (bytes is null && media is not null)
+            {
+                var mediaId = img["mediaId"]?.ToString() ?? "";
+                if (mediaId.Length > 0)
+                {
+                    try
+                    {
+                        var path = media.PathOf(chatId, mediaId);
+                        if (path is not null) bytes = File.ReadAllBytes(path);
+                    }
+                    catch { /* 单张图读不了不影响其余 */ }
+                }
+            }
+
+            if (bytes is null || bytes.Length == 0)
+            {
+                // 静默跳过是 B1「看起来改好了、实际没发图」的温床，留一条日志
+                host.Log.Debug($"图片没进多模态输入：chat={chatId} mediaId={img["mediaId"]?.ToString() ?? ""} " +
+                               $"有data={(img["data"] is null ? "否" : "是")} 原因={(bytes is null ? "取不到字节" : "字节为空")}");
+                continue;
+            }
+            parts.Add(new JsonObject
+            {
+                ["type"] = "image_url",
+                ["image_url"] = new JsonObject
+                {
+                    ["url"] = $"data:{mime};base64,{Convert.ToBase64String(bytes)}",
+                },
+            });
         }
         return parts;
     }
@@ -794,17 +838,36 @@ public sealed class ChatHub : IChatHub
         }
     }
 
-    internal void SendSticker(string chatId, string tag)
+    /// <summary>测试缝：发一张表情。internal 对测试程序集不可见（InternalsVisibleTo 在引用程序集上不生效），
+    /// 照 BuildImagePartsForTest 的做法开一道 public 门。</summary>
+    public void SendStickerForTest(string chatId, string tagOrMd5) => SendSticker(chatId, tagOrMd5);
+
+    internal void SendSticker(string chatId, string tagOrMd5)
     {
         var stickers = Stickers;
         var history = History;
         if (stickers is null || history is null) return;
 
         string? md5 = null;
+        var name = tagOrMd5;   // 标签场景：她写的 <sticker:开心> 本身就是名字
         try
         {
-            var pick = stickers.PickAsync(tag).GetAwaiter().GetResult();
-            md5 = pick ?? stickers.RandomSticker();
+            // #4 断根：落库的 sticker 值必须是 md5 —— ListAsync、客户端 /api/sticker/<值>、
+            // POST api/messages 的 sticker 字段全按 md5 比对，存文件名就必坏。
+            // 传进来的可能是 md5（她自己挑的那张），也可能是标签（她写 <sticker:标签>）：
+            // PathOf 只认库里的 md5，认得出就直接用；认不出才当标签去匹配。
+            if (stickers.PathOf(tagOrMd5) is not null)
+            {
+                md5 = tagOrMd5;
+                // 名字去库里查 —— 别把 md5 当名字喂给模型（历史回显是 [表情：{name}]）
+                var real = StickerNameOfAsync(tagOrMd5).GetAwaiter().GetResult();
+                if (real.Length > 0) name = real;
+            }
+            else
+            {
+                md5 = stickers.PickAsync(tagOrMd5).GetAwaiter().GetResult()
+                      ?? stickers.RandomSticker();
+            }
         }
         catch (Exception ex) { _log.Warn("挑表情出错：" + ex.Message); }
 
@@ -816,8 +879,8 @@ public sealed class ChatHub : IChatHub
             ["text"] = "[表情]",
             ["kind"] = "sticker",
             ["sticker"] = md5,
-            ["name"] = tag,
-            ["caption"] = tag,
+            ["name"] = name,
+            ["caption"] = name,
             ["mark"] = "sticker",
         });
         history.Touch(chatId);

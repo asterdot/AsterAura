@@ -437,6 +437,30 @@ function mediaUrl(m) {
   return BASE + '/api/media/' + encodeURIComponent(m.mediaId) + '?token=' + encodeURIComponent(token)
 }
 
+// 表情消息里存的历史值有两种：裸 md5，和旧写入路径存下来的文件名（manual-<md5>.jpg）。
+// 后者拼进 /api/sticker/ 永远取不到，所以两种都统一抽成 md5。
+const MD5_RE = /[0-9a-f]{32}/i
+function stickerMd5(v) {
+  const s = String(v == null ? '' : v).trim()
+  if (/^[0-9a-f]{32}$/i.test(s)) return s.toLowerCase()
+  const hit = s.match(MD5_RE)
+  return hit ? hit[0].toLowerCase() : ''
+}
+
+// 图片取不到时的兜底。服务端对不存在的表情/媒体回的是 200 + application/json，
+// <img> 只会解码失败、画成破图（人类看到的「图片已损坏」），这里换成一句占位文字。
+function guardMediaImg(img, label) {
+  const swap = () => {
+    if (!img.isConnected) return
+    const span = document.createElement('span')
+    span.className = 'expired'
+    span.textContent = label
+    img.replaceWith(span)
+  }
+  img.addEventListener('error', swap, { once: true })
+  if (img.complete && img.naturalWidth === 0) swap()
+}
+
 function buildMessageNode(m) {
   const mine = m.who === 'user'
   const wrap = document.createElement('div')
@@ -460,10 +484,13 @@ function buildMessageNode(m) {
         (m.heard ? '<div class="heard">听成了：' + esc(m.heard) + '</div>' : '')
       : (m.heard ? '<div class="heard">听成了：' + esc(m.heard) + '</div>' : esc(m.text || '[语音已过期]'))
   } else if (m.kind === 'sticker') {
-    inner += '<img src="' + BASE + '/api/sticker/' + esc(m.sticker) + '" alt="' + esc(m.name || '表情') + '" />'
+    const md5 = stickerMd5(m.sticker)
+    inner += md5
+      ? '<img data-media-fallback="sticker" src="' + BASE + '/api/sticker/' + md5 + '" alt="' + esc(m.name || '表情') + '" />'
+      : '<span class="expired">表情已经不在了</span>'
   } else if (m.kind === 'image') {
     const src = m.mediaId ? mediaUrl(m) : (m.image ? 'data:' + (m.imageMime || 'image/png') + ';base64,' + m.image : '')
-    inner += src ? '<img src="' + src + '" alt="图片" />' : '<span class="expired">图片已经过期了</span>'
+    inner += src ? '<img data-media-fallback="image" src="' + src + '" alt="图片" />' : '<span class="expired">图片已经过期了</span>'
   } else if (refMatch) {
     inner += esc(refMatch[2])
   } else {
@@ -472,6 +499,9 @@ function buildMessageNode(m) {
   if (mine && m.kind === 'image' && cfg?.stickers?.steal !== false) inner += '<button class="collect" data-collect="' + esc(m.id || '') + '">收进表情库</button>'
   wrap.innerHTML = (mine ? '' : '<div class="sender">' + esc(bot()) + '</div>') +
     '<div class="bubble"><div class="body">' + inner + '</div><span class="meta">' + esc(fmtDayClock(m.t)) + (mine ? '<i class="read-mark" data-r="me"></i>' : '<i class="read-mark" data-r="her"></i>') + '</span></div>'
+  wrap.querySelectorAll('img[data-media-fallback]').forEach((img) => {
+    guardMediaImg(img, img.dataset.mediaFallback === 'sticker' ? '表情已经不在了' : '图片已经过期了')
+  })
   wrap.addEventListener('contextmenu', (e) => showMsgMenu(e, m, wrap, refMatch))
   return wrap
 }
@@ -779,6 +809,7 @@ async function openStickerPicker(anchor) {
     box.innerHTML = items.map((i) => '<button class="sticker-opt" data-md5="' + esc(i.md5) + '" title="' + esc(i.name || '还没起名') + '">' +
       '<img src="' + BASE + '/api/sticker/' + esc(i.md5) + '" alt="" />' +
       (i.name ? '<i class="sticker-opt-name">' + esc(i.name) + '</i>' : '') + '</button>').join('')
+    box.querySelectorAll('.sticker-opt img').forEach((img) => guardMediaImg(img, '图没了'))
   }
   box.style.visibility = 'hidden'
   box.style.left = '0px'
@@ -1861,6 +1892,7 @@ async function loadStickerGrid() {
   grid.innerHTML = items.map((i) => '<div class="sticker-item"><img src="' + BASE + '/api/sticker/' + esc(i.md5) + '" alt="" />' +
     '<div class="sticker-name">' + esc(i.name || '没起名') + '</div>' +
     '<div class="sticker-acts"><button data-rename="' + esc(i.md5) + '">改名</button><button data-del-sticker="' + esc(i.md5) + '">删除</button></div></div>').join('')
+  grid.querySelectorAll('.sticker-item img').forEach((img) => guardMediaImg(img, '图没了'))
   grid.onclick = async (e) => {
     const rn = e.target.closest('[data-rename]')
     if (rn) {

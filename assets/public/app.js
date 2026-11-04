@@ -253,13 +253,40 @@ function switchView(id) {
   syncNav()
   const main = $('#main')
   main.innerHTML = ''
-  if (id === 'chat') renderChat(main)
+  if (id === 'chat') { renderChat(main); markReadSoon() }
   else if (id === 'diary') renderDiary(main)
   else if (id === 'mood') views.mood.renderMood(main)
   else if (id === 'overview') views.overview.renderOverview(main)
   else if (id === 'memory') renderMemory(main)
   else if (id === 'settings') renderSettings(main)
   else if (id === 'logs') views.logs.renderLogs(main)
+}
+
+// D3 已读回执：进入聊天页就把"我读到了"发出去；收到对端 read 事件时刷新角标
+let readTimer = null
+function markReadSoon() {
+  if (readTimer) clearTimeout(readTimer)
+  readTimer = setTimeout(async () => {
+    try { await api('/api/read', { method: 'POST' }) } catch { /* 不影响聊天 */ }
+    refreshReadMarks()
+  }, 400)
+}
+async function refreshReadMarks() {
+  try {
+    const r = await api('/api/read')
+    if (!r.ok) return
+    const peer = Number(r.peerReadAt || 0)
+    const box = $('#msgs')
+    if (!box) return
+    // 对方已读时间之后我发的消息标"已读"
+    box.querySelectorAll('.msg.me').forEach((el) => {
+      const mark = el.querySelector('.read-mark')
+      if (!mark) return
+      const mine = Number(el.dataset.t || 0) <= peer
+      mark.classList.toggle('on', mine)
+      mark.title = mine ? '已读' : '未读'
+    })
+  } catch { /* 静默 */ }
 }
 
 async function loadConfig() {
@@ -359,6 +386,7 @@ async function loadMessages() {
   historyState.hasMore = Boolean(r.hasMore)
   renderHistoryMore()
   scrollDown()
+  refreshReadMarks()
 }
 
 // 「查看更早的记录」按钮：只在还有更早的消息时出现，位置固定在列表最上面
@@ -416,6 +444,11 @@ function buildMessageNode(m) {
   wrap.dataset.t = String(m.t || '')
   if (m.id) wrap.dataset.id = String(m.id)
   let inner = ''
+  // D4 引用块：[引用 …] 开头的消息渲染成引用样式
+  const refMatch = (m.kind === 'text' && typeof m.text === 'string') ? m.text.match(/^\[引用 (.+?)\]\n([\s\S]*)$/) : null
+  if (refMatch) {
+    inner += '<div class="quote-block">引用：' + esc(refMatch[1]) + '</div>'
+  }
   if (m.kind === 'voice') {
     const src = m.mediaId ? mediaUrl(m) : (m.voice ? 'data:' + (m.voiceMime || 'audio/mpeg') + ';base64,' + m.voice : '')
     inner = src
@@ -427,17 +460,80 @@ function buildMessageNode(m) {
         (m.heard ? '<div class="heard">听成了：' + esc(m.heard) + '</div>' : '')
       : (m.heard ? '<div class="heard">听成了：' + esc(m.heard) + '</div>' : esc(m.text || '[语音已过期]'))
   } else if (m.kind === 'sticker') {
-    inner = '<img src="' + BASE + '/api/sticker/' + esc(m.sticker) + '" alt="' + esc(m.name || '表情') + '" />'
+    inner += '<img src="' + BASE + '/api/sticker/' + esc(m.sticker) + '" alt="' + esc(m.name || '表情') + '" />'
   } else if (m.kind === 'image') {
     const src = m.mediaId ? mediaUrl(m) : (m.image ? 'data:' + (m.imageMime || 'image/png') + ';base64,' + m.image : '')
-    inner = src ? '<img src="' + src + '" alt="图片" />' : '<span class="expired">图片已经过期了</span>'
+    inner += src ? '<img src="' + src + '" alt="图片" />' : '<span class="expired">图片已经过期了</span>'
+  } else if (refMatch) {
+    inner += esc(refMatch[2])
   } else {
-    inner = esc(m.text || '')
+    inner += esc(m.text || '')
   }
   if (mine && m.kind === 'image' && cfg?.stickers?.steal !== false) inner += '<button class="collect" data-collect="' + esc(m.id || '') + '">收进表情库</button>'
   wrap.innerHTML = (mine ? '' : '<div class="sender">' + esc(bot()) + '</div>') +
-    '<div class="bubble"><div class="body">' + inner + '</div><span class="meta">' + esc(fmtClock(m.t)) + '</span></div>'
+    '<div class="bubble"><div class="body">' + inner + '</div><span class="meta">' + esc(fmtDayClock(m.t)) + (mine ? '<i class="read-mark" data-r="me"></i>' : '<i class="read-mark" data-r="her"></i>') + '</span></div>'
+  wrap.addEventListener('contextmenu', (e) => showMsgMenu(e, m, wrap, refMatch))
   return wrap
+}
+
+// D1：气泡时间——今天只显示 HH:mm，隔天带日期
+function fmtDayClock(t) {
+  if (!t) return ''
+  const d = new Date(Number(t))
+  const now = new Date()
+  const sameDay = d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth() && d.getDate() === now.getDate()
+  const hm = pad2(d.getHours()) + ':' + pad2(d.getMinutes())
+  return sameDay ? hm : (d.getMonth() + 1) + '/' + d.getDate() + ' ' + hm
+}
+
+// D4/D5：右键/长按消息 → 引用整句；选中文字 → 浮出"引用选中/复制"
+function showMsgMenu(e, m, wrap, refMatch) {
+  e.preventDefault()
+  const sel = String(window.getSelection() || '')
+  const menu = document.createElement('div')
+  menu.className = 'msg-menu'
+  const items = []
+  if (sel && sel.length > 0 && m.kind === 'text') {
+    items.push(['引用选中', () => startReply(m, sel)])
+    items.push(['复制选中', () => navigator.clipboard?.writeText(sel).then(() => toast('复制了'))])
+  }
+  if (m.kind === 'text') items.push(['引用整句', () => startReply(m, refMatch ? refMatch[2] : m.text)])
+  items.push(['复制整句', () => navigator.clipboard?.writeText(refMatch ? refMatch[2] : (m.text || '')).then(() => toast('复制了'))])
+  menu.innerHTML = items.map((it, i) => '<button data-i="' + i + '">' + esc(it[0]) + '</button>').join('')
+  menu.style.left = Math.min(e.clientX, window.innerWidth - 140) + 'px'
+  menu.style.top = Math.min(e.clientY, window.innerHeight - items.length * 36 - 12) + 'px'
+  document.body.appendChild(menu)
+  const close = () => { menu.remove(); document.removeEventListener('click', close) }
+  setTimeout(() => document.addEventListener('click', close), 0)
+  menu.onclick = (ev) => {
+    const b = ev.target.closest('button')
+    if (b) items[Number(b.dataset.i)][1]()
+    close()
+  }
+}
+
+// 引用状态：输入框上方显示一条引用条
+let replyCtx = null
+function startReply(m, quoted) {
+  replyCtx = { id: m.id || '', text: quoted || m.text || '' }
+  renderReplyBar()
+}
+function cancelReply() {
+  replyCtx = null
+  renderReplyBar()
+}
+function renderReplyBar() {
+  let bar = $('#reply-bar')
+  const inp = $('#input')
+  if (!replyCtx) { bar && bar.remove(); return }
+  if (!bar) {
+    bar = document.createElement('div')
+    bar.id = 'reply-bar'
+    bar.innerHTML = '<span class="rb-text"></span><button class="rb-cancel">×</button>'
+    ;(inp && inp.parentElement ? inp.parentElement : document.body).appendChild(bar)
+    bar.querySelector('.rb-cancel').onclick = cancelReply
+  }
+  bar.querySelector('.rb-text').textContent = '引用：' + (replyCtx.text || '').slice(0, 60)
 }
 
 // 日期分隔条：同一天的消息只标一个「今天 / 昨天 / 日期」
@@ -493,7 +589,9 @@ async function sendText() {
   inp.value = ''
   inp.style.height = 'auto'
   api('/api/typing', { method: 'POST', body: { typing: false } }).catch(() => {})
-  const r = await api('/api/messages', { method: 'POST', body: { text } })
+  const body = { text }
+  if (replyCtx) { body.replyTo = replyCtx; cancelReply() }
+  const r = await api('/api/messages', { method: 'POST', body })
   if (!r.ok) toast(r.reason || '没发出去', 'err')
   else playSound('out')
 }
@@ -526,6 +624,9 @@ function connectStream() {
       }
     } else if (ev.type === 'typing') {
       if (currentView === 'chat') setTyping(Boolean(ev.on))
+    } else if (ev.type === 'read') {
+      // D3：对端读了 → 刷新"已读"角标
+      if (currentView === 'chat') refreshReadMarks()
     } else if (ev.type === 'history') {
       // 服务端过期清理 / 分片边界变了：把客户端里比 droppedBefore 更早的气泡也删掉
       if (!ev.chatId || !me || String(ev.chatId) === String(me.subject)) {
@@ -1024,6 +1125,7 @@ function renderSettings(main) {
         sectionSelfDrive(),
         sectionWeb(),
         sectionGuests(),
+        sectionDebug(),
         sectionAccount(),
       ]
     : [sectionAccount()]
@@ -1228,6 +1330,8 @@ function sectionModel() {
     models.map((m) => '<option value="' + esc(m.provider + '::' + m.model) + '">' + esc(m.provider + ' / ' + m.model) + '</option>').join('') +
     '</select></div></div>' +
     rowSelect('思考强度', 'model.reasoningEffort', [['off', '关'], ['low', '低'], ['medium', '中'], ['high', '高']]) +
+    rowInput('API Key', 'model.apiKey', '自定义模型专用；留空保持不变', 'password') +
+    rowInput('API 地址', 'model.baseUrl', '自定义模型的接口地址，如 https://api.deepseek.com/v1') +
     '</div></div>'
 }
 
@@ -1385,12 +1489,40 @@ function sectionLogs() {
     '</div></div>'
 }
 
+function sectionDebug() {
+  return '<div class="section"><h3>上下文调试</h3><div class="body">' +
+    '<div class="row"><label>看看她在想什么</label><div class="ctl">' +
+    '<button class="ghost small" id="ctx-load">拉取当前上下文</button>' +
+    '<button class="ghost small" id="ctx-compress">手动压一次</button></div></div>' +
+    '<div id="ctx-view" class="ctx-view hidden"></div>' +
+    '</div></div>'
+}
+
+async function loadContextDebug() {
+  const view = $('#ctx-view')
+  if (!view) return
+  view.classList.remove('hidden')
+  view.textContent = '拉取中…'
+  const r = await api('/api/debug/context')
+  if (!r.ok) { view.textContent = r.reason || '拉取失败'; return }
+  const sec = (title, body) => '<div class="ctx-sec"><b>' + esc(title) + '</b><pre>' + esc(body || '（空）') + '</pre></div>'
+  let html = '<div class="muted" style="font-size:12px;margin-bottom:6px">约 ' + (r.approxTokens || 0) + ' tokens · 窗口 ' + (r.recentCount || 0) + '/' + (r.keepRecent || 30) + ' 条 · 工具 ' + (r.toolCount || 0) + ' 个</div>'
+  html += sec('压缩摘要', r.compress && r.compress.summary ? r.compress.summary : '还没有压缩摘要')
+  for (const p of (r.systemParts || [])) html += sec(p.name || '段', p.text)
+  html += '<div class="ctx-sec"><b>最近原文（' + (r.recentCount || 0) + ' 条）</b>'
+  html += '<pre>' + (r.recentWindow || []).map((m) =>
+    (m.who === 'bot' ? '她' : '对方') + ': ' + (m.hasMedia ? '[带图]' : '') + (m.text || '[' + m.kind + ']')
+  ).join('\n') + '</pre></div>'
+  html += '<div class="ctx-sec"><b>她手里的工具</b><pre>' + (r.tools || []).map((t) => t.name).join('\n') + '</pre></div>'
+  view.innerHTML = html
+}
+
 function sectionHistory() {
   return '<div class="section"><h3>聊天记录</h3><div class="body">' +
-    rowNum('保留天数', 'history.keepDays', '聊天记录、图片、语音一起按天清理') +
+    rowNum('媒体保留天数', 'history.keepDays', '0 = 永不清理；聊天文字永远保留，这里只管图片语音') +
     '<div class="row"><label>分片</label><div class="ctl"><span class="muted" style="font-size:12px">' +
     '聊完（空闲 2 分钟）后按每 100 条自动切成一个文件，一个文件就是界面的一页；' +
-    '翻到顶可以点「查看更早的记录」取上一页。图片和语音单独存放，过期后服务器和浏览器缓存一起清。' +
+    '翻到顶可以点「查看更早的记录」取上一页。图片和语音单独存放，超过保留天数才清，文字永远保留。' +
     '</span></div></div>' +
     '</div></div>'
 }
@@ -1582,6 +1714,13 @@ function bindSectionEvents(box) {
   $('#sd-save') && ($('#sd-save').onclick = async () => {
     const r = await api('/api/selfdrive', { method: 'POST', body: { text: $('#sd-text').value } })
     toast(r.ok ? '备忘录存好了' : (r.reason || '没存上'), r.ok ? '' : 'err')
+  })
+  $('#ctx-load') && ($('#ctx-load').onclick = loadContextDebug)
+  $('#ctx-compress') && ($('#ctx-compress').onclick = async () => {
+    toast('正在压…')
+    const r = await api('/api/debug/compress', { method: 'POST' })
+    toast(r.ok ? (r.summarized ? '压完了：' + r.summarized + ' 条进摘要' : '没有要压的') : (r.reason || r.message || '没压成'), r.ok ? '' : 'err')
+    if (r.ok) loadContextDebug()
   })
 }
 

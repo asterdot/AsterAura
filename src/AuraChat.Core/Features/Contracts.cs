@@ -15,6 +15,12 @@ public interface IToolRegistry
     void Register(ToolDef tool);
     IReadOnlyList<ToolDef> All();
     Task<string> InvokeAsync(string name, JsonObject args, CancellationToken ct = default);
+
+    /// <summary>按名字登记一个能跑的工具（聊天中枢给自装工具用；同名覆盖之前的声明）。</summary>
+    void Register(string name, Func<JsonObject, CancellationToken, Task<string>> run);
+
+    /// <summary>登记了多少个工具（schema + 可跑的总数）。</summary>
+    int Count { get; }
 }
 
 /// <summary>记忆（features/memory.js）：召回、写入、压缩、管理面板。</summary>
@@ -203,6 +209,12 @@ public interface IHistoryStore
 
     void Finalize(string chatId);
 
+    /// <summary>标成已读（写 read.json 的 lastReadAt），返回之前有多少条未读。D3 已读回执用。</summary>
+    Task<int> MarkReadAsync(string chatId, CancellationToken ct = default);
+
+    /// <summary>对方最后的已读时间（毫秒；没读过 0）。</summary>
+    long LastReadAt(string chatId);
+
     JsonObject Stats();
 }
 
@@ -229,6 +241,9 @@ public interface IChatHub
 
     /// <summary>闲置主动搭话（原 speakup）。</summary>
     Task<bool> SpeakUpAsync(CancellationToken ct = default);
+
+    /// <summary>自驱推送（selfdrive → 聊天层）：cue 是她刚看到的/做了的事，让她用自己的口吻发给主人。</summary>
+    Task<bool> SelfDrivePushAsync(string cue, CancellationToken ct = default);
 
     Task StartAsync(CancellationToken ct = default);
 

@@ -71,6 +71,25 @@ public sealed class LlmClient : ILlmClient
                 : null).Trim();
     }
 
+    /// <summary>
+    /// 一次非流式调用，返回原始 message 对象（可能含 tool_calls）。工具循环（ToolLoop）用。
+    /// </summary>
+    public async Task<JsonObject> AskMessageAsync(
+        LlmOptions options,
+        IReadOnlyList<LlmMessage> messages,
+        JsonArray? tools = null,
+        JsonArray? toolHistory = null,
+        CancellationToken ct = default)
+    {
+        var ep = Resolve(options);
+        var body = BuildBody(options, messages, ep.ModelOr(options.Model), stream: false, logprobs: false, tools: tools, toolHistory: toolHistory);
+        using var resp = await SendAsync(ep, body, options.TimeoutMs, stream: false, ct).ConfigureAwait(false);
+        var json = await ReadJsonAsync(resp, ct).ConfigureAwait(false);
+        return (json["choices"] is JsonArray { Count: > 0 } choices
+                ? (choices[0] as JsonObject)?["message"] as JsonObject
+                : null) ?? new JsonObject();
+    }
+
     public async IAsyncEnumerable<string> StreamAsync(
         LlmOptions options,
         IReadOnlyList<LlmMessage> messages,
@@ -149,7 +168,9 @@ public sealed class LlmClient : ILlmClient
         string model,
         bool stream,
         bool logprobs,
-        int topLogprobs = 0)
+        int topLogprobs = 0,
+        JsonArray? tools = null,
+        JsonArray? toolHistory = null)
     {
         var list = new JsonArray();
 
@@ -160,10 +181,14 @@ public sealed class LlmClient : ILlmClient
         foreach (var m in messages)
         {
             if (m is null) continue;
+            // content 若是 JSON 数组（多模态 [{type:text},{type:image_url}]），原样透传；否则当纯文本
+            JsonNode? content = (m.Content ?? "").StartsWith('[')
+                ? JsonNode.Parse(m.Content)
+                : m.Content;
             list.Add(new JsonObject
             {
                 ["role"] = NormalizeRole(m.Role),
-                ["content"] = m.Content ?? "",
+                ["content"] = content ?? (m.Content ?? ""),
             });
         }
 
@@ -173,6 +198,12 @@ public sealed class LlmClient : ILlmClient
             ["messages"] = list,
             ["stream"] = stream,
         };
+        if (tools is { Count: > 0 }) body["tools"] = tools.DeepClone();
+        if (toolHistory is not null)
+        {
+            // tool 轮次的完整历史（assistant 的 tool_calls + 每条 tool 结果）追加在 messages 后面
+            foreach (var node in toolHistory) list.Add(node!.DeepClone());
+        }
 
         // o1 / o3 / gpt-5 这类推理模型不接受 temperature，也不接受 max_tokens
         var reasoningOnly = IsReasoningOnlyModel(model);

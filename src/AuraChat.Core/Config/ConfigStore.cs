@@ -114,7 +114,7 @@ public sealed class ConfigStore(DataStore store, AppLog log)
   },
   "memory": {
     "enabled": true,
-    "recallCount": 6,
+    "recallCount": 3,
     "dailyConsolidate": true,
     "consolidateTimes": ["04:00", "16:00"],
     "compressEveryHours": 6,
@@ -131,7 +131,7 @@ public sealed class ConfigStore(DataStore store, AppLog log)
     "dedupeBump": 10,
     "maxItems": 60
   },
-  "history": { "keepDays": 7 },
+  "history": { "keepDays": 0 },
   "selfDrive": {
     "enabled": false,
     "intervalMinutes": 60,
@@ -328,7 +328,7 @@ public sealed class ConfigStore(DataStore store, AppLog log)
 
         var mem = Sub(c, "memory");
         mem["consolidateTimes"] = NormalizeTimes(mem["consolidateTimes"]);
-        mem["recallCount"] = Num(mem["recallCount"], 6, 0, 20);
+        mem["recallCount"] = Num(mem["recallCount"], 3, 0, 20);
         mem["compressEveryHours"] = Num(mem["compressEveryHours"], 6, 1, 168);
         mem["gradeFull"] = Num(mem["gradeFull"], 0.7, 0.05, 0.99);
         mem["gradeBrief"] = Num(mem["gradeBrief"], 0.3, 0.01, 0.95);
@@ -338,8 +338,10 @@ public sealed class ConfigStore(DataStore store, AppLog log)
         if (mem["gradeDrop"]!.GetValue<double>() > mem["gradeBrief"]!.GetValue<double>())
             mem["gradeDrop"] = mem["gradeBrief"]!.DeepClone();
 
-        if (c["history"] is not JsonObject) c["history"] = new JsonObject { ["keepDays"] = 7 };
-        Sub(c, "history")["keepDays"] = Num(Sub(c, "history")["keepDays"], 7, 1, 365);
+        // keepDays = 媒体保留天数；0 = 永不清理。文本永不按天删（2026-11-03 拍板）。
+        if (c["history"] is not JsonObject) c["history"] = new JsonObject { ["keepDays"] = 0 };
+        // keepDays 是整数天数，存成 JsonValue<int>，避免 double 序列化和下游 (int) 转换炸
+        Sub(c, "history")["keepDays"] = (int)Num(Sub(c, "history")["keepDays"], 0, 0, 365);
 
         if (c["gaps"] is not JsonObject) c["gaps"] = new JsonObject();
         var gaps = Sub(c, "gaps");

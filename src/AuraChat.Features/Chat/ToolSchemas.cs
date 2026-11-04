@@ -34,6 +34,8 @@ public static class ToolSchemas
     public const string UseSkill = "use_skill";
     public const string DrawImage = "web_draw_image";
     public const string SendImage = "web_send_image";
+    public const string CheckClock = "check_clock";
+    public const string CheckHistory = "check_history";
 
     public static readonly ToolSchema WebSendSticker = new(
         SendSticker,
@@ -157,12 +159,29 @@ public static class ToolSchemas
             ["note"] = Str("一句话说明"),
         }, "path"));
 
-    /// <summary>全部 17 个工具，顺序与原 tools.js 注册顺序一致。</summary>
+    public static readonly ToolSchema CheckClockTool = new(
+        CheckClock,
+        "看一眼现在的时间（几点、日期、星期）。想说「现在几点」「早上好还是晚安」、拿不准过了多久时用。",
+        Parameters(new JsonObject()));
+
+    public static readonly ToolSchema CheckHistoryTool = new(
+        CheckHistory,
+        "回读这个聊天的历史记录原文（包括以前收到的图片是哪张，结果里会标出图片）。想回忆之前聊过什么、找某张图、核对「我之前说过什么」时用。keyword 写要找的关键词；不填就返回最近几条。wantImages=true 表示专门在找图片。",
+        Parameters(new JsonObject
+        {
+            ["keyword"] = Str("要找的关键词，可选"),
+            ["days"] = Int("往回翻几天，默认 7，最多 90"),
+            ["count"] = Int("最多返回几条，默认 20，最多 50"),
+            ["wantImages"] = Bool("true = 只找带图片的消息（做表情包/看过的图都能翻到）"),
+        }));
+
+    /// <summary>全部 19 个工具，顺序与原 tools.js 注册顺序一致。</summary>
     public static readonly IReadOnlyList<ToolSchema> All =
     [
         WebSendSticker, WebListStickers, WebEditSticker, WebChatHistory,
         WebSendMessage, WebAddSticker, WebFindStickers, WebDrawSticker, WebWriteDiary, WebEditMemo,
         RememberTool, RecallMemoryTool, GapListTool, GapResolveTool, UseSkillTool, WebDrawImage, WebSendImage,
+        CheckClockTool, CheckHistoryTool,
     ];
 
     private static readonly Dictionary<string, ToolSchema> ByName =

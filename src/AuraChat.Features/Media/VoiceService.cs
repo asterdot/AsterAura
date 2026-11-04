@@ -123,8 +123,16 @@ public sealed class VoiceService : IVoiceService
 
     private static string? PyEnvPython()
     {
-        var py = Path.Combine(PyEnvDir(), "python.exe");
-        return File.Exists(py) ? py : null;
+        // venv 布局兼容：Windows venv/uv 的解释器在 Scripts\python.exe，裸目录（老布局/绿色版）在根 python.exe
+        foreach (var py in new[]
+                 {
+                     Path.Combine(PyEnvDir(), "Scripts", "python.exe"),
+                     Path.Combine(PyEnvDir(), "python.exe"),
+                 })
+        {
+            if (File.Exists(py)) return py;
+        }
+        return null;
     }
 
     private static bool EdgeInstalled() =>

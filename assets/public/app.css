@@ -453,3 +453,17 @@ body[data-wall] .msg.me .bubble { background: var(--bubble-me); }
 .heard { margin-top: 6px; font-size: 12px; opacity: .72; }
 .inline-edit { display: flex; gap: 6px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
 .inline-edit input { flex: 1; min-width: 160px; }
+/* ---- D4 引用块 / D5 消息菜单 / D3 已读角标 / C3 上下文调试 ---- */
+.quote-block { border-left: 3px solid var(--accent, #3b82f6); background: rgba(120,140,180,.12); padding: 4px 8px; margin-bottom: 6px; border-radius: 6px; font-size: 12px; opacity: .85; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.msg-menu { position: fixed; z-index: 999; background: var(--bg, #fff); border: 1px solid rgba(128,128,128,.35); border-radius: 10px; box-shadow: 0 6px 24px rgba(0,0,0,.18); padding: 4px; display: flex; flex-direction: column; min-width: 120px; }
+.msg-menu button { border: 0; background: none; text-align: left; padding: 8px 12px; border-radius: 8px; font-size: 13px; cursor: pointer; }
+.msg-menu button:hover { background: rgba(128,128,128,.15); }
+.read-mark { display: inline-block; width: 8px; height: 8px; margin-left: 4px; border-radius: 50%; background: rgba(128,128,128,.35); vertical-align: middle; }
+.read-mark.on { background: #34c759; }
+#reply-bar { display: flex; align-items: center; gap: 8px; margin: 4px 8px; padding: 6px 10px; border-left: 3px solid var(--accent, #3b82f6); background: rgba(120,140,180,.12); border-radius: 8px; font-size: 12px; }
+#reply-bar .rb-text { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; opacity: .85; }
+#reply-bar .rb-cancel { border: 0; background: none; cursor: pointer; font-size: 14px; opacity: .6; }
+.ctx-view { margin-top: 8px; max-height: 420px; overflow: auto; border: 1px solid rgba(128,128,128,.25); border-radius: 10px; padding: 10px; }
+.ctx-sec { margin-bottom: 10px; }
+.ctx-sec b { display: block; font-size: 12px; opacity: .7; margin-bottom: 2px; }
+.ctx-sec pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-size: 12px; line-height: 1.5; font-family: inherit; }

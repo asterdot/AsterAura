@@ -30,6 +30,14 @@ public interface ILlmClient
 {
     Task<string> AskAsync(LlmOptions options, IReadOnlyList<LlmMessage> messages, CancellationToken ct = default);
 
+    /// <summary>非流式调用，返回原始 message 对象（可能含 tool_calls）。工具循环用；tools/toolHistory 可空。</summary>
+    Task<JsonObject> AskMessageAsync(
+        LlmOptions options,
+        IReadOnlyList<LlmMessage> messages,
+        JsonArray? tools = null,
+        JsonArray? toolHistory = null,
+        CancellationToken ct = default);
+
     IAsyncEnumerable<string> StreamAsync(LlmOptions options, IReadOnlyList<LlmMessage> messages, CancellationToken ct = default);
 
     Task<LlmLogprobResult> AskWithLogprobsAsync(LlmOptions options, IReadOnlyList<LlmMessage> messages, CancellationToken ct = default);

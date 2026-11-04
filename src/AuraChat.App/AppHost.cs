@@ -43,11 +43,13 @@ public sealed class AppHost : IAsyncDisposable
         Server = server;
         _chat = chat;
         _selfDrive = selfDrive;
+        _compressor = api.Env.Get<ContextCompressor>();
         _tickLoop = TickLoopAsync(_tickCts.Token);
     }
 
     private readonly ChatHub _chat;
     private readonly SelfDriveService _selfDrive;
+    private readonly ContextCompressor? _compressor;
     private readonly CancellationTokenSource _tickCts = new();
     private readonly Task _tickLoop;
     private bool _servicesStarted;
@@ -97,11 +99,16 @@ public sealed class AppHost : IAsyncDisposable
         env.Set(new ToolRegistry(env));
         LifeModule.Create(env);
         var media = MediaModule.Create(env);
-        env.Set(new HistoryStore(env, media));
+        var historyStore = new HistoryStore(env, media);
+        env.Set(historyStore);
+        env.Set(new ContextCompressor(env, historyStore));
         var chat = new ChatHub(env);
         env.Set(chat);
         var selfDrive = env.Get<SelfDriveService>()
             ?? throw new InvalidOperationException("自驱服务没装配上");
+
+        // 自驱 → 聊天层接线：她刷到的/自己做的，由她自己的口吻发出来（原来这条线没接，冲浪结果永远到不了对话里）
+        selfDrive.PushToOwner = (cue, ct) => chat.SelfDrivePushAsync(cue, ct);
 
         var api = new ApiContext
         {
@@ -146,14 +153,15 @@ public sealed class AppHost : IAsyncDisposable
         }
     }
 
-    /// <summary>启动功能服务：聊天中枢 + 自驱。幂等，进程内只生效一次。</summary>
+    /// <summary>启动功能服务：聊天中枢 + 自驱 + 上下文压缩。幂等，进程内只生效一次。</summary>
     public async Task StartServicesAsync()
     {
         if (_servicesStarted) return;
         _servicesStarted = true;
         await _chat.StartAsync();
         await _selfDrive.StartAsync();
-        Log.Child("app").Info("功能服务已启动（聊天中枢 / 自驱）");
+        _compressor?.Start();
+        Log.Child("app").Info("功能服务已启动（聊天中枢 / 自驱 / 上下文压缩）");
     }
 
     /// <summary>每分钟巡检：记忆到点整理、日记到点写、空间到点逛。进程全程跑，出错只记日志。</summary>

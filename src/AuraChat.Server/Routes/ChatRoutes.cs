@@ -1,6 +1,7 @@
 using System.Text.Json.Nodes;
 using AuraChat.Core.Features;
 using AuraChat.Core.Media;
+using AuraChat.Features.Media;
 
 namespace AuraChat.Server.Routes;
 
@@ -63,12 +64,22 @@ public static class ChatRoutes
             var images = b["images"] as JsonArray ?? new JsonArray();
             var voice = b["voice"] as JsonObject;
             var sticker = b["sticker"]?.ToString() ?? "";
+            var replyTo = b["replyTo"] as JsonObject;   // D4 引用：{id, text}（id 是被引用消息 id）
             var name = api.Auth.DisplayNameOf(me.Subject);
 
             if (text.Trim().Length == 0 && images.Count == 0 && voice is null && sticker.Length == 0)
             {
                 await HttpUtil.Fail(call.Http, "没说啥");
                 return;
+            }
+
+            // 引用块拼进消息文本（落库即带，各端都能看到）
+            if (replyTo is not null)
+            {
+                var refId = replyTo["id"]?.ToString() ?? "";
+                var refText = (replyTo["text"]?.ToString() ?? "").Replace("\n", " ");
+                if (refId.Length > 0 || refText.Length > 0)
+                    text = $"[引用 {MediaUtil.Slice(refText, 60)}]\n" + text;
             }
 
             var media = api.Get<MediaStore>();
@@ -228,6 +239,41 @@ public static class ChatRoutes
             var typing = AuraChat.Core.JsonUtil.Bool(b["typing"], false);
             api.Get<IChatHub>()?.NotifyTyping(ApiContext.ChatIdOf(me.Subject), typing);
             await HttpUtil.JsonAsync(call.Http, new JsonObject { ["ok"] = true });
+        });
+
+        // ---------- 已读回执（D3）----------
+        r.Add("POST", "api/read", async call =>
+        {
+            var me = await api.RequireUserAsync(call);
+            if (me is null) return;
+            var history = api.Get<IHistoryStore>();
+            if (history is null) { await HttpUtil.Fail(call.Http, "聊天记录没装上"); return; }
+
+            var chatId = ApiContext.ChatIdOf(me.Subject);
+            var unread = await history.MarkReadAsync(chatId);
+            // 广播给对端：她/主人能看到"对方看到了"
+            api.Emit("read", new JsonObject
+            {
+                ["chatId"] = chatId,
+                ["subject"] = me.Subject,
+                ["readAt"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            });
+            await HttpUtil.JsonAsync(call.Http, new JsonObject { ["ok"] = true, ["unreadBefore"] = unread });
+        });
+
+        // 对端的已读时间（渲染"已读/未读"角标用）
+        r.Add("GET", "api/read", async call =>
+        {
+            var me = await api.RequireUserAsync(call);
+            if (me is null) return;
+            var history = api.Get<IHistoryStore>();
+            if (history is null) { await HttpUtil.Fail(call.Http, "聊天记录没装上"); return; }
+            await HttpUtil.JsonAsync(call.Http, new JsonObject
+            {
+                ["ok"] = true,
+                ["myReadAt"] = await Task.FromResult(history.LastReadAt(ApiContext.ChatIdOf(me.Subject))),
+                ["peerReadAt"] = history.LastReadAt(ApiContext.ChatIdOf(AuraChat.Core.AuraChatInfo.OwnerId)),
+            });
         });
     }
 

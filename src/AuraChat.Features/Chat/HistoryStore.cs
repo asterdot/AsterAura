@@ -23,8 +23,8 @@ public sealed class HistoryStore : IHistoryStore
     /// <summary>空闲多久做一次裁切/清理（原 IDLE_MS = 2 分钟）。</summary>
     public const int IdleMs = 2 * 60 * 1000;
 
-    /// <summary>默认保留天数（原 DEFAULT_KEEP_DAYS）。</summary>
-    public const int DefaultKeepDays = 7;
+    /// <summary>媒体默认保留天数；0 = 永不清理。聊天文本永远不按天删（2026-11-03 拍板）。</summary>
+    public const int DefaultKeepDays = 0;
 
     /// <summary>孤儿媒体至少放 1 小时再删（原 ORPHAN_GRACE_MS）。</summary>
     public const long OrphanGraceMs = 60 * 60 * 1000;
@@ -115,7 +115,7 @@ public sealed class HistoryStore : IHistoryStore
     private int KeepDays()
     {
         var n = _host.Num(DefaultKeepDays, "history", "keepDays");
-        return n is > 0 and <= 365 ? (int)n : DefaultKeepDays;
+        return n is >= 0 and <= 365 ? (int)n : DefaultKeepDays;
     }
 
     // ---------- 索引（原 readIndex / ensureSeq / rebuildIndex / writeIndex） ----------
@@ -456,109 +456,45 @@ public sealed class HistoryStore : IHistoryStore
 
     private JsonObject SweepLocked(string chatId)
     {
-        var cutoff = Now - KeepDays() * 86_400_000L;
+        // 2026-11-03 拍板：聊天文本/分片永不按天删。keepDays 只管媒体文件（0 = 媒体也永久保留）。
+        var keepDays = KeepDays();
+        var cutoff = Now - keepDays * 86_400_000L;
         var idx = ReadIndexLocked(chatId);
-        var segs = (JsonArray)idx["segments"]!;
-        var keep = new JsonArray();
-        var dropped = 0;
-        var trimmed = false;
 
-        foreach (var node in segs.ToList())
+        var mediaDeleted = 0;
+
+        // 只清媒体目录里比保留期更旧的文件；文本消息与分片文件一律不动
+        if (keepDays > 0)
         {
-            if (node is not JsonObject seg || Int(seg["count"]) <= 0) continue;
-            var id = Text(seg["id"]);
-
-            // 整片过期：连片带媒体一起删
-            if (Long(seg["to"]) <= cutoff)
+            try
             {
-                if (ReadSegLocked(chatId, id)?["messages"] is JsonArray old)
+                var dir = _media.DirOf(chatId);
+                if (Directory.Exists(dir))
                 {
-                    foreach (var m in old)
+                    foreach (var f in Directory.GetFiles(dir))
                     {
-                        if (m?["mediaId"] is { } mediaId) _media.Delete(chatId, Text(mediaId));
-                        dropped++;
-                    }
-                }
-                TryDelete(SegFile(chatId, id));
-                continue;
-            }
-
-            // 片跨过期线：掐掉过期的消息重写
-            if (Long(seg["from"]) <= cutoff)
-            {
-                var data = ReadSegLocked(chatId, id);
-                var rest = new JsonArray();
-                if (data?["messages"] is JsonArray messages)
-                {
-                    foreach (var m in messages)
-                    {
-                        if (m is not null && Long(m["t"]) > cutoff)
+                        try
                         {
-                            rest.Add(m.DeepClone());
-                            continue;
+                            if (new FileInfo(f).LastWriteTimeUtc < DateTimeOffset.FromUnixTimeMilliseconds(cutoff).UtcDateTime)
+                            {
+                                File.Delete(f);
+                                mediaDeleted++;
+                            }
                         }
-                        if (m?["mediaId"] is { } mediaId) _media.Delete(chatId, Text(mediaId));
-                        dropped++;
+                        catch { /* 单个媒体删不掉不影响清理 */ }
                     }
                 }
-                if (rest.Count == 0)
-                {
-                    TryDelete(SegFile(chatId, id));
-                    continue;
-                }
-                seg["from"] = Long(rest[0]?["t"]);
-                seg["to"] = Long(rest[rest.Count - 1]?["t"]);
-                seg["count"] = rest.Count;
-                DataStore.WriteJson(SegFile(chatId, id), new JsonObject
-                {
-                    ["chatId"] = chatId,
-                    ["id"] = id,
-                    ["from"] = seg["from"]!.DeepClone(),
-                    ["to"] = seg["to"]!.DeepClone(),
-                    ["messages"] = rest,
-                });
-                trimmed = true;
-                keep.Add(seg.DeepClone());
-                continue;
             }
-
-            keep.Add(seg.DeepClone());
+            catch { /* 目录读不了就跳过 */ }
         }
-
-        if (keep.Count != segs.Count || trimmed)
-        {
-            idx["segments"] = keep;
-            WriteIndexLocked(chatId, idx);
-        }
-
-        // media 目录里比保留期更旧的文件一律清掉（消息片删掉后的孤儿也在这里）
-        try
-        {
-            var dir = _media.DirOf(chatId);
-            if (Directory.Exists(dir))
-            {
-                foreach (var f in Directory.GetFiles(dir))
-                {
-                    try
-                    {
-                        if (new FileInfo(f).LastWriteTimeUtc < DateTimeOffset.FromUnixTimeMilliseconds(cutoff).UtcDateTime)
-                        {
-                            File.Delete(f);
-                        }
-                    }
-                    catch { /* 单个媒体删不掉不影响清理 */ }
-                }
-            }
-        }
-        catch { /* 目录读不了就跳过 */ }
 
         var orphans = ReapOrphanMediaLocked(chatId);
         var oldest = OldestAtLocked(chatId);
         var total = TotalOfLocked(chatId);
         return new JsonObject
         {
-            ["changed"] = dropped > 0,
-            ["dropped"] = dropped,
+            ["changed"] = mediaDeleted > 0,
+            ["dropped"] = mediaDeleted,
             ["orphans"] = orphans,
             ["oldestAt"] = oldest,
             ["hasMore"] = total > 0,
@@ -1011,6 +947,20 @@ public sealed class HistoryStore : IHistoryStore
             }
             return unread;
         }, ct);
+
+    /// <summary>对方最后的已读时间（毫秒；没读过 0）。D3 已读回执用。</summary>
+    public long LastReadAt(string chatId)
+    {
+        _io.Wait();
+        try
+        {
+            return Long(DataStore.ReadObject(ReadFile(chatId))["lastReadAt"]);
+        }
+        finally
+        {
+            _io.Release();
+        }
+    }
 
     /// <summary>未读数：lastReadAt 之后机器人发的消息条数。</summary>
     public int Unread(string chatId)

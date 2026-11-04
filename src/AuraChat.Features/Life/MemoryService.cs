@@ -123,7 +123,8 @@ public sealed partial class MemoryService : IMemoryService
 
     private bool Enabled => _host.Flag(true, "memory", "enabled");
 
-    private int RecallCount => Math.Clamp(_host.Int(6, "memory", "recallCount"), 0, 20);
+    // 记忆板块降级（C1）：上下文压缩+回读已能记住对话，记忆只当"提纯要点"的辅助，注入条数下调
+    private int RecallCount => Math.Clamp(_host.Int(3, "memory", "recallCount"), 0, 20);
 
     // ---------------- 条目增删改 ----------------
 

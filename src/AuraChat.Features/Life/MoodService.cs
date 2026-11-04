@@ -132,7 +132,8 @@ public sealed partial class MoodService : IMoodService
                 JsonUtil.Num(_state["dopamine"], 50),
                 JsonUtil.Num(_state["cortisol"], 20),
                 JsonUtil.Num(_state["serotonin"], 50));
-            at = JsonUtil.Int(_state["at"], (int)NowMs());
+            // at 是毫秒时间戳，超出 int32：必须按 long 读，溢出会把衰减算成几万天、三轴直接回基线
+            at = (long)JsonUtil.Num(_state["at"], NowMs());
         }
         if (!DecayEnabled) return saved;
         return HormoneMath.Decayed(saved, at, NowMs());

@@ -19,7 +19,8 @@ public sealed class ChatHub : IChatHub
     private const int MergeMaxMs = 8000;
     private const int TypingHoldMaxMs = 25_000;
     private const int BusyMaxMs = 240_000;
-    private const int ContextMessageCount = 30;
+    /// <summary>上下文里最近多少条原文不压（保留新鲜感）。</summary>
+    public const int ContextMessageCount = 30;
 
     private sealed class Pending
     {
@@ -67,10 +68,101 @@ public sealed class ChatHub : IChatHub
 
     public Task StartAsync(CancellationToken ct = default)
     {
+        RegisterSelfTools();
         if (_ticker is not null) return Task.CompletedTask;
         _cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         _ticker = Task.Run(() => TickLoopAsync(_cts.Token));
         return Task.CompletedTask;
+    }
+
+    /// <summary>把 check_clock / check_history 两个回读工具挂进注册表（她按需查时间/翻聊天记录）。</summary>
+    private void RegisterSelfTools()
+    {
+        if (_host.Get<IToolRegistry>() is not { } tools) return;
+
+        tools.Register(ToolSchemas.CheckClock, (_, _) =>
+        {
+            var now = DateTime.Now;
+            var cn = now.ToString("yyyy-MM-dd HH:mm:ss") + " " + "日一二三四五六"[(int)now.DayOfWeek] + "曜日";
+            var hour = now.Hour;
+            var period = hour switch
+            {
+                >= 5 and < 8 => "清晨",
+                < 11 => "上午",
+                < 13 => "中午",
+                < 18 => "下午",
+                < 23 => "晚上",
+                _ => "深夜",
+            };
+            return Task.FromResult($"现在是 {cn}（{period}，{hour} 点）。");
+        });
+
+        tools.Register(ToolSchemas.CheckHistory, (args, ct) => CheckHistoryAsync(args, ct));
+    }
+
+    /// <summary>回读聊天记录：按关键词/天数/条数查原文，wantImages=true 只翻带图的（表情包场景）。</summary>
+    private async Task<string> CheckHistoryAsync(JsonObject args, CancellationToken ct)
+    {
+        var history = History;
+        if (history is null) return "聊天记录还没装上。";
+
+        var keyword = args["keyword"]?.ToString() ?? "";
+        var days = Math.Clamp((int)JsonUtil.Num(args["days"], 7), 1, 90);
+        var count = Math.Clamp((int)JsonUtil.Num(args["count"], 20), 1, 50);
+        var wantImages = JsonUtil.Bool(args["wantImages"], false);
+
+        var since = DateTimeOffset.UtcNow.AddDays(-days).ToUnixTimeMilliseconds();
+        var hits = new List<JsonObject>();
+        long cursor = 0;
+        var scanned = 0;
+        const int scanCap = 2000;
+
+        while (hits.Count < count && scanned < scanCap)
+        {
+            var (page, oldestAt, hasMore) = history.Page(AuraChatInfo.OwnerId, cursor, 100);
+            if (page.Count == 0) break;
+            scanned += page.Count;
+            foreach (var m in page)
+            {
+                if (m is not JsonObject msg) continue;
+                var t = msg["t"]?.GetValue<long>() ?? 0;
+                if (t < since) continue;
+                if (wantImages && msg["mediaId"] is null) continue;
+                var text = msg["text"]?.ToString() ?? "";
+                if (keyword.Length > 0 && !text.Contains(keyword, StringComparison.OrdinalIgnoreCase))
+                {
+                    // 图片消息按文件名/备注再试一次
+                    if (!(wantImages && msg["mediaMime"]?.ToString()?.StartsWith("image") == true && keyword.Length == 0))
+                        continue;
+                }
+                hits.Add((JsonObject)msg.DeepClone());
+            }
+            if (!hasMore || oldestAt <= 0) break;
+            cursor = oldestAt;
+        }
+
+        if (hits.Count == 0)
+            return wantImages ? $"最近 {days} 天没翻到带图的消息。" : $"最近 {days} 天没翻到含「{keyword}」的消息。";
+
+        var lines = new List<string> { $"【回读 · 最近{days}天内 {hits.Count} 条】" };
+        foreach (var m in hits)
+        {
+            var time = DateTimeOffset.FromUnixTimeMilliseconds(m["t"]?.GetValue<long>() ?? 0)
+                .ToLocalTime().ToString("MM-dd HH:mm");
+            var who = m["who"]?.ToString() == "bot" ? "你" : "对方";
+            var kind = m["kind"]?.ToString() ?? "text";
+            var body = kind switch
+            {
+                "image" => $"[图片：mediaId={m["mediaId"]}]",
+                "voice" => $"[语音 {m["dur"]}秒]",
+                "sticker" => $"[表情：{m["name"]}]",
+                _ => m["text"]?.ToString() ?? "",
+            };
+            lines.Add($"{time} {who}: {body}");
+        }
+        if (wantImages)
+            lines.Add("（要引用哪张图做表情，把那次的 mediaId 记下来配合 web_add_sticker 用。）");
+        return string.Join("\n", lines);
     }
 
     public async Task StopAsync()
@@ -330,7 +422,17 @@ public sealed class ChatHub : IChatHub
         string reply;
         try
         {
-            reply = await llm.AskAsync(options, messages);
+            // 有登记过的工具就走工具循环（模型可能调 check_clock / web_add_sticker 等），否则纯文本
+            var tools = _host.Get<IToolRegistry>();
+            if (tools is { Count: > 0 })
+            {
+                var loop = new ToolLoop(llm, tools, Log.Child("tools"));
+                reply = await loop.RunAsync(options, messages, default);
+            }
+            else
+            {
+                reply = await llm.AskAsync(options, messages);
+            }
         }
         catch (Exception ex)
         {
@@ -402,6 +504,21 @@ public sealed class ChatHub : IChatHub
             catch (Exception ex) { _log.Warn("回忆出错：" + ex.Message); }
         }
 
+        // 上下文压缩摘要（C2）：被压出窗口的旧对话用摘要顶上，原文永远在聊天记录里
+        try
+        {
+            var summary = _host.Get<ContextCompressor>()?.SummaryOf(p.ChatId);
+            if (summary?["summary"] is { } sum && !string.IsNullOrWhiteSpace(sum.ToString()))
+            {
+                var to = summary["coversTo"]?.ToString();
+                var when = long.TryParse(to, out var toMs)
+                    ? DateTimeOffset.FromUnixTimeMilliseconds(toMs).ToLocalTime().ToString("MM-dd HH:mm")
+                    : "早些时候";
+                parts.Add($"【更早的对话（截至 {when}）的摘要】\n{sum}");
+            }
+        }
+        catch { /* 摘要拿不到不影响 */ }
+
         return string.Join("\n\n", parts.Where(x => !string.IsNullOrWhiteSpace(x)));
     }
 
@@ -436,11 +553,55 @@ public sealed class ChatHub : IChatHub
         sb.Append(string.Join("\n", p.Texts.Where(t => t.Length > 0)));
         if (p.Images.Count > 0) sb.Append($"\n（还发了 {p.Images.Count} 张图片）");
 
-        messages.Add(new LlmMessage("user", sb.ToString()));
+        // 图片走多模态：本条 user 消息的 content 是 [文本, image_url, ...]（模型不支持时会报错回落纯文本，见 Catch）
+        var imageParts = BuildImagePartsForTest(_host, p.ChatId, p.Images);
+        if (imageParts.Count > 0)
+        {
+            var contentArr = new JsonArray
+            {
+                new JsonObject { ["type"] = "text", ["text"] = sb.ToString() },
+            };
+            foreach (var part in imageParts) contentArr.Add(part.DeepClone());
+            messages.Add(new LlmMessage("user", contentArr.ToJsonString()));
+        }
+        else
+        {
+            messages.Add(new LlmMessage("user", sb.ToString()));
+        }
 
         // system 走 options.System，不塞 messages
         _ = system;
         return messages;
+    }
+
+    /// <summary>把图片转成多模态 content parts（data:image;base64）。文件缺失/读不了的跳过。public 供测试直调。</summary>
+    public static List<JsonObject> BuildImagePartsForTest(FeatureHost host, string chatId, List<JsonObject> images)
+    {
+        var parts = new List<JsonObject>();
+        var media = host.Get<MediaStore>();
+        if (media is null) return parts;
+        foreach (var img in images)
+        {
+            var mediaId = img["mediaId"]?.ToString() ?? "";
+            var mime = img["mediaMime"]?.ToString() ?? "image/png";
+            if (mediaId.Length == 0) continue;
+            try
+            {
+                var path = media.PathOf(chatId, mediaId);
+                if (path is null) continue;
+                var bytes = File.ReadAllBytes(path);
+                parts.Add(new JsonObject
+                {
+                    ["type"] = "image_url",
+                    ["image_url"] = new JsonObject
+                    {
+                        ["url"] = $"data:{mime};base64,{Convert.ToBase64String(bytes)}",
+                    },
+                });
+            }
+            catch { /* 单张图读不了不影响其余 */ }
+        }
+        return parts;
     }
 
     private LlmOptions BuildOptions(JsonObject cfg, string? system = null, double? temperature = null)
@@ -708,6 +869,12 @@ public sealed class ChatHub : IChatHub
     public async Task<bool> SpeakUpAsync(CancellationToken ct = default)
     {
         return await SpeakUpCoreAsync(AuraChatInfo.OwnerId, "", ct);
+    }
+
+    /// <summary>自驱（selfdrive）推送入口：把"她刚刷到/自己做了什么"喂给她，让她用自己的口气发给主人。</summary>
+    public async Task<bool> SelfDrivePushAsync(string cue, CancellationToken ct = default)
+    {
+        return await SpeakUpCoreAsync(AuraChatInfo.OwnerId, cue, ct);
     }
 
     private async Task<bool> SpeakUpCoreAsync(string chatId, string cue, CancellationToken ct)

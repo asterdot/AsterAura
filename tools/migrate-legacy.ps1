@@ -4,6 +4,13 @@
 # azone-social.json / mood.json / chats/ / stickers/ / media/ / personas/ ...），
 # 所以本质就是一次递归复制；另外可选地把 web.port 改掉，避开旧插件占用的 2332。
 #
+# 本版变更: 原子 staging 迁移——
+#   1) 先把源数据 robocopy 到目标同父目录下的临时 staging 目录（同卷，保证原子改名）；
+#   2) 可选把既有目标合并进 staging（robocopy /XO：绝不覆盖目标中更新的文件）；
+#   3) 在 staging 内做端口改写与严格对账（存在 + 大小 + SHA-256）；
+#   4) 对账通过才把 staging 原子搬到目标（[System.IO.Directory]::Move），失败自动回滚。
+#   中途失败绝不把半份数据留在目标里：staging 原样保留并打印路径，exit 2。
+#
 # 安全合同（相对旧版的行为收口）:
 #   - -Source / -Dest 必须显式传入，脚本没有任何默认真实路径；
 #   - 默认 DryRun: 不带 -Apply 时只打印迁移计划——不创建目录、不复制、不读取任何文件内容、
@@ -31,7 +38,7 @@
 #
 # 退出码:
 #   0 = 成功（DryRun 计划成立 / Apply 复制并对账通过）
-#   2 = 操作失败（源清单构建失败 / robocopy 失败 / 对账不符 / 端口改写失败 / 结果清单写入失败）
+#   2 = 操作失败（源清单构建失败 / robocopy 失败 / 对账不符 / 端口改写失败 / 结果清单写入失败 / 原子切换失败）
 #   3 = 用法或输入无效（缺 -Source/-Dest / 源不存在或不是目录或盘根 / 仓库或守卫库缺失 /
 #       清单路径拼法非法）
 #   4 = 歧义拒绝（源目标相同或互相嵌套 / 目标已存在且非空且未显式 -MergeExisting /
@@ -127,6 +134,18 @@ if ($destExists -and $destEntries.Count -gt 0 -and -not $MergeExisting) {
     Write-Host "REFUSED(exit 4): Dest 已存在且非空（拒绝混入既有内容; 确要并入请显式 -MergeExisting）: $destReal"; exit 4
 }
 
+# 2g. staging / backup 命名（目标同父目录; 同卷 → Directory.Move 才是原子改名）
+$destTrim = $destReal.TrimEnd('\')
+$destName = [System.IO.Path]::GetFileName($destTrim)
+$destParent = [System.IO.Path]::GetDirectoryName($destTrim)
+$stamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
+$nonce = [Guid]::NewGuid().ToString('N').Substring(0, 8)
+$stagingName = "$destName.migstage-$stamp-$nonce"
+$backupName = "$destName.migbackup-$stamp-$nonce"
+# staging / backup 同样不得落入受保护根（防御纵深）
+$stagingReal = Assert-PublicationPath -Path (Join-Path $destParent $stagingName) -ProtectedRoots $pubProtected -What 'Staging 目录'
+$backupReal = Assert-PublicationPath -Path (Join-Path $destParent $backupName) -ProtectedRoots $pubProtected -What 'Backup 目录'
+
 $mode = 'dryrun'
 if ($Apply) { $mode = 'apply' }
 Write-Host "== migrate-legacy ($mode) =="
@@ -138,9 +157,10 @@ if ($MergeExisting) { Write-Host '合并    : 显式 -MergeExisting（并入非�
 # =============== DryRun: 只给计划，不读内容、不建目录、不复制、不出数据统计 ===============
 if (-not $Apply) {
     $state = '不存在（Apply 时将创建）'
-    if ($destExists) { $state = "已存在（顶层 $($destEntries.Count) 个条目）" }
+    if ($destExists) { $state = "已存在（非空）" }
     Write-Host "目标状态 : $state"
-    if ($Port -gt 0) { Write-Host "端口计划 : Apply 且目标存在 config.json 时把 web.port 改为 $Port" }
+    Write-Host "Staging  : Apply 时在目标同父目录下建临时 staging 目录，对账通过后才原子切换到目标"
+    if ($Port -gt 0) { Write-Host "端口计划 : Apply 且 staging 内 config.json 存在时把 web.port 改为 $Port" }
     Write-Host '（DryRun: 未读取任何文件内容，未创建目录，未复制任何数据; 加 -Apply 才会执行迁移）'
     exit 0
 }
@@ -151,6 +171,47 @@ function Get-FileSha256([string]$path) {
     $fs = [System.IO.File]::OpenRead($path)
     try { return ($sha.ComputeHash($fs) | ForEach-Object { $_.ToString('x2') }) -join '' }
     finally { $fs.Close(); $sha.Dispose() }
+}
+
+function Write-ResultManifest {
+    # 只在 Apply 落盘; 已存在则拒绝覆盖; 无 BOM UTF-8。
+    param([string]$Reconciliation, [string]$SwapState, $ConflictList, $SupersededList, [int]$VerifiedFiles, [long]$VerifiedBytes, [int]$ExtraCount)
+    if ([string]::IsNullOrWhiteSpace($manifestFull)) { return }
+    if (Test-Path -LiteralPath $manifestFull) {
+        Write-Host "REFUSED(exit 2): 结果清单路径已存在（绝不静默覆盖）: $manifestFull"; exit 2
+    }
+    $m = [ordered]@{
+        schema           = $ManifestSchema
+        packageStatus    = $PackageStatus
+        mode             = 'apply'
+        source           = $srcReal
+        dest             = $destReal
+        mergeExisting    = [bool]$MergeExisting
+        staging          = $stagingReal
+        backup           = $backupReal
+        robocopyExitCode = $rc
+        mergeExitCode    = $rcMerge
+        portRequested    = $Port
+        portApplied      = $portApplied
+        portError        = $portError
+        startedAtUtc     = $startedAt
+        finishedAtUtc    = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+        expected         = @{ files = $expected.Count; bytes = $expectedBytes }
+        verified         = @{ files = $VerifiedFiles; bytes = $VerifiedBytes }
+        extraDestFiles   = $ExtraCount
+        conflicts        = $ConflictList
+        superseded       = $SupersededList
+        reconciliation   = $Reconciliation
+        swapState        = $SwapState
+        files            = $expected
+    }
+    try {
+        $json = $m | ConvertTo-Json -Depth 6
+        [System.IO.File]::WriteAllText($manifestFull, $json, (New-Object System.Text.UTF8Encoding($false)))
+        Write-Host "结果清单: $manifestFull"
+    } catch {
+        Write-Host "REFUSED(exit 2): 结果清单写入失败: $($_.Exception.Message)"; exit 2
+    }
 }
 
 # --- 3a. 预检清单: 全量枚举 + SHA-256（此步失败 → exit 2, 尚未发生任何写入） ---
@@ -186,22 +247,41 @@ foreach ($f in $files) {
 }
 Write-Host ("预检清单: {0} 个文件, {1} 字节" -f $expected.Count, $expectedBytes)
 
-# --- 3b. robocopy 增量复制（不删除目标已有内容; /XO 不覆盖目标中更新的文件; 限制重试避免卡死） ---
-# 直接 & 调用而不是 Start-Process —— 这台机器的 no_proxy/NO_PROXY 环境变量重名，Start-Process 会直接抛异常
-& robocopy "$srcReal" "$destReal" /E /XO /R:2 /W:2 /NFL /NDL /NJH /NJS /NP | Out-Null
-# robocopy 0-7 都算成功（1=有复制，2=有多余文件，等等）
+# --- 3b. staging 准备（同父目录; 同卷保证 Directory.Move 原子） ---
+if (Test-Path -LiteralPath $stagingReal) {
+    Write-Host "REFUSED(exit 2): Staging 目录已存在（意外冲突）: $stagingReal"; exit 2
+}
+$null = New-Item -ItemType Directory -Path $stagingReal -Force
+Write-Host "Staging 目录: $stagingReal"
+
+# --- 3c. robocopy 源 → staging（/E 递归 /xo 不覆盖更新的; 直接 & 调用不用 Start-Process） ---
+& robocopy "$srcReal" "$stagingReal" /E /XO /R:2 /W:2 /NFL /NDL /NJH /NJS /NP | Out-Null
 $rc = $LASTEXITCODE
-if ($rc -ge 8) {
-    Write-Host "REFUSED(exit 2): robocopy 失败，退出码 $rc（目标可能只有部分数据; 修复后重跑前先人工检查目标）"; exit 2
+# robocopy 返回码是位掩码: 1=有文件被复制 2=有额外文件 4=有文件/目录复制失败 8=失败 16=严重错误
+# rc=1/2/3 属正常（有复制/有额外/两者都有）；只要位 4/8/16 任一被置位即为失败。
+if (($rc -band 4) -ne 0 -or ($rc -band 8) -ne 0 -or ($rc -band 16) -ne 0) {
+    Write-Host "REFUSED(exit 2): robocopy 源→staging 失败，退出码 $rc（staging 保留: $stagingReal）"; exit 2
 }
 
-# --- 3c. 端口改写（可选; 仅 Apply; 失败按操作失败处理, 不静默跳过） ---
+# --- 3d. 合并: Dest → staging（仅 -MergeExisting 且 Dest 已存在且非空; /XO 不覆盖目标更新的文件） ---
+$rcMerge = 0
+if ($MergeExisting -and $destExists -and $destEntries.Count -gt 0) {
+    & robocopy "$destReal" "$stagingReal" /E /XO /R:2 /W:2 /NFL /NDL /NJH /NJS /NP | Out-Null
+    $rcMerge = $LASTEXITCODE
+    # 位掩码判定: 4=有复制失败 8=失败 16=严重错误（同上）
+    if (($rcMerge -band 4) -ne 0 -or ($rcMerge -band 8) -ne 0 -or ($rcMerge -band 16) -ne 0) {
+        Write-Host "REFUSED(exit 2): robocopy Dest→staging 合并失败，退出码 $rcMerge（staging 保留: $stagingReal）"; exit 2
+    }
+    Write-Host "已把既有目标合并进 staging（/XO: 目标中更新的文件保留）"
+}
+
+# --- 3e. 端口改写（可选; 仅 Apply; 在 staging 内改; 失败按操作失败处理, 不静默跳过） ---
 $portApplied = $null
 $portError = ''
 if ($Port -gt 0) {
-    $cfgPath = Join-Path $destReal 'config.json'
+    $cfgPath = Join-Path $stagingReal 'config.json'
     try {
-        if (-not (Test-Path -LiteralPath $cfgPath -PathType Leaf)) { throw "目标没有 config.json: $cfgPath" }
+        if (-not (Test-Path -LiteralPath $cfgPath -PathType Leaf)) { throw "staging 没有 config.json: $cfgPath" }
         $cfg = Get-Content $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
         if (-not $cfg.web) { $cfg | Add-Member -NotePropertyName web -NotePropertyValue ([pscustomobject]@{}) }
         $cfg.web | Add-Member -NotePropertyName port -NotePropertyValue $Port -Force
@@ -237,95 +317,157 @@ if ($Port -gt 0) {
         }
     } catch {
         $portError = $_.Exception.Message
-        Write-Host "端口改写失败（数据已复制，端口未动）: $portError"
+        Write-Host "端口改写失败（数据已复制到 staging，端口未动）: $portError"
     }
 }
 
-# --- 3d. 严格对账: 期望文件逐个核对 存在 + 大小 + SHA-256 ---
+# --- 3f. 严格对账: 在 staging 内逐个核对 存在 + 大小 + SHA-256 ---
 $verified = 0
 $verifiedBytes = [long]0
 $conflicts = New-Object 'System.Collections.Generic.List[object]'
-$destBase = $destReal.TrimEnd('\')
-$destFileSet = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+$superseded = New-Object 'System.Collections.Generic.List[object]'
+$stgBase = $stagingReal.TrimEnd('\')
 try {
-    $destFiles = @(Get-ChildItem -LiteralPath $destReal -Recurse -File -Force -ErrorAction Stop)
+    $stgFiles = @(Get-ChildItem -LiteralPath $stagingReal -Recurse -File -Force -ErrorAction Stop)
 } catch {
-    Write-Host "REFUSED(exit 2): Dest 枚举失败（对账中止）: $($_.Exception.Message)"; exit 2
+    Write-Host "REFUSED(exit 2): Staging 枚举失败（对账中止; staging 保留: $stagingReal）: $($_.Exception.Message)"; exit 2
 }
-foreach ($df in $destFiles) { [void]$destFileSet.Add($df.FullName.Substring($destBase.Length + 1)) }
+$stgFileSet = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+foreach ($sf in $stgFiles) { [void]$stgFileSet.Add($sf.FullName.Substring($stgBase.Length + 1)) }
 foreach ($e in $expected) {
-    $dp = Join-Path $destReal $e.path
+    $dp = Join-Path $stagingReal $e.path
     if (-not (Test-Path -LiteralPath $dp -PathType Leaf)) {
-        $conflicts.Add([pscustomobject]@{ path = $e.path; status = 'missing'; detail = 'robocopy 后目标缺失' }); continue
+        $conflicts.Add([pscustomobject]@{ path = $e.path; status = 'missing'; detail = 'robocopy 后 staging 缺失' }); continue
     }
     $di = Get-Item -LiteralPath $dp -Force
     $newer = $di.LastWriteTimeUtc -gt $e.mtime
-    if ($di.Length -ne $e.size) {
-        $status = 'conflict-mismatch'
-        if ($newer) { $status = 'conflict-dest-newer' }
-        $conflicts.Add([pscustomobject]@{ path = $e.path; status = $status; detail = "大小不符 src=$($e.size) dst=$($di.Length)" }); continue
-    }
+    $same = $true
+    # 先无条件算出 staging 实体的 SHA-256（大小不同也要算）:
+    # superseded-newer 分支要把实际 hash 写回期望清单供切换后终检比对, 若此处留空会导致误报冲突。
     try { $dh = Get-FileSha256 $dp } catch {
-        $conflicts.Add([pscustomobject]@{ path = $e.path; status = 'conflict-mismatch'; detail = "目标文件不可读: $($_.Exception.Message)" }); continue
+        $conflicts.Add([pscustomobject]@{ path = $e.path; status = 'conflict-mismatch'; detail = "staging 文件不可读: $($_.Exception.Message)" }); continue
     }
-    if ($dh -ine $e.sha256) {
-        $status = 'conflict-mismatch'
-        if ($newer) { $status = 'conflict-dest-newer' }
-        $conflicts.Add([pscustomobject]@{ path = $e.path; status = $status; detail = 'SHA-256 不符' }); continue
+    if ($di.Length -ne $e.size) {
+        $same = $false
+    } elseif ($dh -ine $e.sha256) {
+        $same = $false
     }
-    $verified++; $verifiedBytes += $e.size
+    if ($same) {
+        $verified++; $verifiedBytes += $e.size
+        continue
+    }
+    # 不一致: MergeExisting 且目标版本更新 → 接受目标版本（superseded-newer），不是冲突
+    if ($MergeExisting -and $newer) {
+        # 审计需求: 覆盖前先保存源版本的哈希，供 manifest 还原“被保留的目标版本对应的源哈希”
+        $srcSha = $e.sha256
+        $superseded.Add([pscustomobject]@{ path = $e.path; status = 'superseded-newer'; detail = '目标版本更新（目标保留，源版本不覆盖）'; sourceSha256 = $srcSha })
+        $e.size = $di.Length
+        $e.mtime = $di.LastWriteTimeUtc
+        $e.mtimeUtc = $di.LastWriteTimeUtc.ToString('yyyy-MM-ddTHH:mm:ssZ')
+        $e.sha256 = $dh
+        $verified++; $verifiedBytes += $di.Length
+        continue
+    }
+    $status = 'conflict-mismatch'
+    if ($newer) { $status = 'conflict-dest-newer' }
+    $conflicts.Add([pscustomobject]@{ path = $e.path; status = $status; detail = 'staging 内容与期望不符（存在/大小/SHA-256）' })
 }
 $expectedSet = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
 foreach ($e in $expected) { [void]$expectedSet.Add($e.path) }
-$extra = @($destFileSet | Where-Object { -not $expectedSet.Contains($_) })
+$extra = @($stgFileSet | Where-Object { -not $expectedSet.Contains($_) })
 
-# --- 3e. 结果清单落盘（仅 Apply; 可选 -ManifestPath; 失败 = exit 2） ---
-$finishedAt = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
-$reconciliation = 'fail'
-if ($conflicts.Count -eq 0) { $reconciliation = 'pass' }
-if (-not [string]::IsNullOrWhiteSpace($manifestFull)) {
-    $manifest = [ordered]@{
-        schema           = $ManifestSchema
-        packageStatus    = $PackageStatus
-        mode             = 'apply'
-        source           = $srcReal
-        dest             = $destReal
-        mergeExisting    = [bool]$MergeExisting
-        robocopyExitCode = $rc
-        portRequested    = $Port
-        portApplied      = $portApplied
-        portError        = $portError
-        startedAtUtc     = $startedAt
-        finishedAtUtc    = $finishedAt
-        expected         = @{ files = $expected.Count; bytes = $expectedBytes }
-        verified         = @{ files = $verified; bytes = $verifiedBytes }
-        extraDestFiles   = $extra.Count
-        conflicts        = $conflicts
-        reconciliation   = $reconciliation
-        files            = $expected
-    }
-    try {
-        $json = $manifest | ConvertTo-Json -Depth 6
-        [System.IO.File]::WriteAllText($manifestFull, $json, (New-Object System.Text.UTF8Encoding($false)))
-        Write-Host "结果清单: $manifestFull"
-    } catch {
-        Write-Host "REFUSED(exit 2): 结果清单写入失败: $($_.Exception.Message)"; exit 2
-    }
-}
-
-# --- 3f. 终报 ---
+# --- 3g. 对账不通过 → 绝不切换目标（staging 原样保留） ---
 if ($conflicts.Count -gt 0) {
     Write-Host ("对账失败: {0} 处冲突:" -f $conflicts.Count)
     $conflicts | Select-Object -First 10 | ForEach-Object {
         Write-Host ("  [{0}] {1}: {2}" -f $_.status, $_.path, $_.detail)
     }
-    if ($conflicts.Count -gt 10) { Write-Host "  ... 其余 $($conflicts.Count - 10) 条见结果清单" }
     Write-Host '（绝不静默覆盖; 冲突未解决前不得对同一目标重复 Apply）'
+    Write-Host "REFUSED(exit 2): 对账未通过，未切换到目标（staging 保留: $stagingReal）"
+    Write-ResultManifest -Reconciliation 'fail' -SwapState 'not-swapped' -ConflictList $conflicts -SupersededList $superseded -VerifiedFiles $verified -VerifiedBytes $verifiedBytes -ExtraCount $extra.Count
     exit 2
 }
 if ($portError) {
-    Write-Host "REFUSED(exit 2): 迁移已复制但对账后的端口改写未完成: $portError"; exit 2
+    Write-Host "REFUSED(exit 2): 迁移已复制到 staging 但端口改写未完成，未切换到目标: $portError"
+    Write-ResultManifest -Reconciliation 'fail' -SwapState 'not-swapped' -ConflictList $conflicts -SupersededList $superseded -VerifiedFiles $verified -VerifiedBytes $verifiedBytes -ExtraCount $extra.Count
+    exit 2
 }
-Write-Host ("对账通过: {0}/{1} 个文件逐一核对（存在 + 大小 + SHA-256）; 目标多出 {2} 个非预期文件（保留不删）" -f $verified, $expected.Count, $extra.Count)
+
+# --- 3h. 原子切换: staging → dest（修复缺陷 A: 用 Directory.Move 而非 Move-Item；不是子目录替换） ---
+$swapState = 'pending'
+$needBackup = $false
+if (Test-Path -LiteralPath $destReal) {
+    if (Test-Path -LiteralPath $backupReal) {
+        Write-Host "REFUSED(exit 2): backup 目录已存在（意外冲突）: $backupReal"; exit 2
+    }
+    try {
+        [System.IO.Directory]::Move($destReal, $backupReal)
+        $needBackup = $true
+        Write-Host "既有目标已移至备份: $destReal -> $backupReal"
+    } catch {
+        # 目标被进程占用句柄等导致 Move 失败时，必须以 exit 2 退出（不是 exit 1），
+        # 并打印 staging 路径让用户知道数据在哪，保证审计链完整。
+        Write-Host "REFUSED(exit 2): 原目标无法移至备份（可能被进程占用）: $($_.Exception.Message)"
+        Write-Host "staging 保留: $stagingReal"
+        Write-ResultManifest -Reconciliation 'fail' -SwapState 'not-swapped' -ConflictList $conflicts -SupersededList $superseded -VerifiedFiles $verified -VerifiedBytes $verifiedBytes -ExtraCount $extra.Count
+        exit 2
+    }
+}
+try {
+    [System.IO.Directory]::Move($stagingReal, $destReal)
+    Write-Host "原子切换完成: $stagingReal -> $destReal"
+    $swapState = 'swapped'
+} catch {
+    Write-Host "原子切换失败: $($_.Exception.Message)"
+    if ($needBackup -and -not (Test-Path -LiteralPath $destReal) -and (Test-Path -LiteralPath $backupReal)) {
+        try { [System.IO.Directory]::Move($backupReal, $destReal); Write-Host "已回滚: 原目标已从备份恢复" }
+        catch { Write-Host "回滚失败（原目标仍在备份: $backupReal）: $($_.Exception.Message)" }
+    }
+    $swapState = 'failed'
+    Write-Host "REFUSED(exit 2): 原子切换失败（staging 保留: $stagingReal）"
+    Write-ResultManifest -Reconciliation 'fail' -SwapState $swapState -ConflictList $conflicts -SupersededList $superseded -VerifiedFiles $verified -VerifiedBytes $verifiedBytes -ExtraCount $extra.Count
+    exit 2
+}
+if ($needBackup) { Write-Host "原目标备份保留于: $backupReal" }
+
+# --- 3i. 切换后终检: dest 中所有期望文件 存在 + 大小 + SHA-256 ---
+$postVerified = 0
+$postBytes = [long]0
+$postConflicts = New-Object 'System.Collections.Generic.List[object]'
+foreach ($e in $expected) {
+    $dp = Join-Path $destReal $e.path
+    if (-not (Test-Path -LiteralPath $dp -PathType Leaf)) {
+        $postConflicts.Add([pscustomobject]@{ path = $e.path; status = 'missing-post-swap'; detail = '切换后目标缺失' }); continue
+    }
+    $di = Get-Item -LiteralPath $dp -Force
+    if ($di.Length -ne $e.size) {
+        $postConflicts.Add([pscustomobject]@{ path = $e.path; status = 'conflict-mismatch-post'; detail = "大小不符 stg=$($e.size) dst=$($di.Length)" }); continue
+    }
+    try { $dh = Get-FileSha256 $dp } catch {
+        $postConflicts.Add([pscustomobject]@{ path = $e.path; status = 'conflict-mismatch-post'; detail = "目标不可读: $($_.Exception.Message)" }); continue
+    }
+    if ($dh -ine $e.sha256) {
+        $postConflicts.Add([pscustomobject]@{ path = $e.path; status = 'conflict-mismatch-post'; detail = 'SHA-256 不符（切换后）' }); continue
+    }
+    $postVerified++; $postBytes += $e.size
+}
+if ($postConflicts.Count -gt 0) {
+    Write-Host "REFUSED(exit 2): 切换后终检发现 $($postConflicts.Count) 处冲突:"
+    $postConflicts | Select-Object -First 10 | ForEach-Object {
+        Write-Host ("  [{0}] {1}: {2}" -f $_.status, $_.path, $_.detail)
+    }
+    Write-Host '（数据已落到目标，但终检不符; 请人工检查目标与备份）'
+    Write-ResultManifest -Reconciliation 'fail' -SwapState $swapState -ConflictList $postConflicts -SupersededList $superseded -VerifiedFiles $postVerified -VerifiedBytes $postBytes -ExtraCount $extra.Count
+    exit 2
+}
+
+# --- 3j. 结果清单落盘（仅 Apply; 可选 -ManifestPath; 失败 = exit 2） ---
+Write-ResultManifest -Reconciliation 'pass' -SwapState $swapState -ConflictList $conflicts -SupersededList $superseded -VerifiedFiles $postVerified -VerifiedBytes $postBytes -ExtraCount $extra.Count
+
+# --- 3k. 终报 ---
+if ($superseded.Count -gt 0) {
+    Write-Host ("合并: {0} 个文件按目标版本保留（比源更新，未被覆盖）" -f $superseded.Count)
+}
+Write-Host ("对账通过: {0}/{1} 个文件逐一核对（存在 + 大小 + SHA-256）; 目标多出 {2} 个非预期文件（保留不删）" -f $postVerified, $expected.Count, $extra.Count)
 Write-Host '迁移完成。跑 AuraChat.exe 前记得确认端口没和旧插件（DSH 宿主里的 2332）冲突。'
 exit 0

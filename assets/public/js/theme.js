@@ -1,12 +1,15 @@
-let refs = { base: '', cfg: () => null, state: () => null }
-let bgStamp = String(Date.now())
+let refs = { base: '', cfg: () => null, state: () => null, fetchLocalBg: null }
 let lastDark = null
 let wired = false
+let bgApplySeq = 0
 
 export function bindTheme(next) { refs = next }
 
-export function bgUrl() { return refs.base + '/api/background?v=' + bgStamp }
-export function bustBackground() { bgStamp = String(Date.now()) }
+// 本地背景图不再直接拼 <base>/api/background 的 CSS url——原生 CSS url 带不了凭证，
+// 会让头像/背景类资源绕开授权。应用层用带 Bearer 的 fetch 取回 blob 后把 object URL 递进来
+// （refs.fetchLocalBg）；没登录/没背景图就回 none。
+export function bgUrl() { return refs.base + '/api/background' }
+export function bustBackground() { applyTheme() }
 
 export function themeCfg() {
   const cfg = refs.cfg()
@@ -46,7 +49,19 @@ export function applyTheme() {
   if (plain) { if (document.body.dataset.wallplain !== '1') document.body.dataset.wallplain = '1' }
   else if (document.body.dataset.wallplain) delete document.body.dataset.wallplain
   let img = 'none'
-  if (wall && t.background) img = t.background === 'local' ? 'url("' + bgUrl() + '")' : 'url("' + t.background + '")'
+  if (wall && t.background) {
+    if (t.background === 'local') {
+      // 本地背景：占位 none 先生效，授权取回 blob 后再换上；取不到（未登录/无图）就保持 none
+      const stamp = ++bgApplySeq
+      refs.fetchLocalBg?.().then((u) => {
+        if (stamp !== bgApplySeq || !u) return   // 期间主题又变过：这次结果作废
+        const next = 'url("' + u + '")'
+        if (document.body.style.getPropertyValue('--bg-image') !== next) document.body.style.setProperty('--bg-image', next)
+      }).catch(() => {})
+    } else {
+      img = 'url("' + t.background + '")'
+    }
+  }
   if (document.body.style.getPropertyValue('--bg-image') !== img) document.body.style.setProperty('--bg-image', img)
   if (window.matchMedia && !wired) {
     wired = true

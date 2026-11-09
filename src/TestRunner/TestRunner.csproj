@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    测试运行器工具（环境适配）：
+    本机的 `dotnet test` testhost 在启动时 SetParentProcessExitCallback → OpenProcess(父进程) 报 Win32Exception(5)「拒绝访问」，
+    测试运行整体中止（与源码无关，属宿主环境对进程句柄的限制）。
+    此工具用 xunit 官方执行引擎（xunit.runner.utility 的 AssemblyRunner）在本进程内跑测试程序集，
+    绕开 testhost 生成链，产出与 xunit.console 同口径的真实测试摘要。
+    用法：dotnet run 加 project=src/TestRunner、Release 配置，参数传 AuraChat.Tests.dll 路径。
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="xunit.extensibility.execution" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.utility" Version="2.9.2" />
+    <!-- 被测测试程序集用到 ASP.NET Core 类型（HttpContext 等），与 testhost 一样要挂共享框架 -->
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+</Project>

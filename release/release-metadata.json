@@ -1,0 +1,74 @@
+{
+  "schema": "aster-aura.release-metadata/v1",
+  "product": "Aster Aura (AuraChat)",
+  "version": "2.0.0",
+  "versionSource": "src/AuraChat.App/AuraChat.App.csproj <Version>2.0.0</Version>",
+  "runtime": {
+    "targetFramework": "net9.0-windows",
+    "rid": "win-x64",
+    "deploymentModel": "framework-dependent (self-contained: false)",
+    "sharedFrameworks": [
+      "Microsoft.NETCore.App 9.0",
+      "Microsoft.WindowsDesktop.App 9.0",
+      "Microsoft.AspNetCore.App 9.0"
+    ],
+    "sdk": "9.0.x (global.json pins 9.0.320, rollForward latestFeature)"
+  },
+  "packageType": "unsigned on-disk folder bundle (publish output + metadata + SHA-256 manifests); no installer package",
+  "releaseStatus": "internal development and testing build. Not commercially ready; not for end-user distribution.",
+  "commercialReadiness": false,
+  "entryPoint": "AuraChat.exe",
+  "localService": {
+    "bind": "127.0.0.1",
+    "defaultPort": 2332
+  },
+  "reproducibility": {
+    "deterministicBuild": true,
+    "pathMap": "/aura/<ProjectName> (Directory.Build.props)",
+    "identityBoundAtBundleTime": "identity.txt / bundle.json record HEAD + git status/diff hashes; a bundle is only meaningful against the recorded source snapshot"
+  },
+  "tooling": {
+    "bundle": "tools/release-bundle.ps1",
+    "verify": "tools/release-verify.ps1",
+    "publicationGuard": "tools/_publication-guard.ps1",
+    "installUpdate": "tools/install-update.ps1",
+    "dataMigration": "tools/migrate-legacy.ps1"
+  },
+  "localInstallUpdate": {
+    "entryPoint": "tools/install-update.ps1",
+    "actions": ["Install", "Rollback", "Status"],
+    "packageStatus": "LOCAL-ONLY / UNSIGNED DEVELOPMENT: local install/update/rollback skeleton; no code signing, no network update, no diagnostics upload, no cloud/mobile/ads/credits; not commercially ready",
+    "signing": "unsigned (no Authenticode/catalog; bundle integrity via SHA-256 manifest recomputation only)",
+    "updateChannel": "none; local on-disk bundles only (versionId = <release-metadata.version>-<bundle.json.diffHash first 8 hex>)",
+    "rollback": "atomic active.json pointer swap (same-volume tmp write + File.Replace); failed installs roll back staging and keep the previous pointer; previously installed versions are never deleted",
+    "writeBoundary": "all writes stay inside the explicitly passed -InstallRoot validated by the publication boundary guard before any write; bundle directory is read-only input",
+    "exitCodes": {
+      "0": "success",
+      "2": "operation failure (manifest hash mismatch / bundle verification failed / copy or re-verify failed / pointer switch failed - already rolled back)",
+      "3": "usage or input invalid",
+      "4": "ambiguity refusal (before any write)",
+      "7": "PUBLICATION_DENIED (publication boundary guard)"
+    }
+  },
+  "dataMigration": {
+    "entryPoint": "tools/migrate-legacy.ps1",
+    "contract": "legacy Node data -> .NET data directory migration; explicit -Source/-Dest required (no default real paths); default DryRun (plan only: no directory creation, no copy, no file-content reads, no real-data statistics); real copy only with explicit -Apply",
+    "pathSafety": "source and dest path chains validated via tools/_publication-guard.ps1: per-level realpath, junction/symlink refusal, UNC/'..' refusal, whole-tree reparse audit of source and existing dest, source/dest overlap refusal; dest protected roots = source repo + system directories (user profile intentionally not a migration protected root: data legitimately lives there; safety comes from explicit paths + default DryRun + explicit -Apply)",
+    "conflictPolicy": "non-empty dest refused (exit 4) without explicit -MergeExisting; robocopy /XO never overwrites newer dest files; any expected file missing/size-mismatch/hash-mismatch after copy exits 2 (conflict-dest-newer when dest is newer); port rewrite (optional -Port) failure exits 2",
+    "manifest": "pre-flight SHA-256 inventory of source (unreadable file fails before any write), per-file reconciliation (existence + size + SHA-256) after copy; optional -ManifestPath JSON (aster-aura.migration-manifest/v1, guard-validated path, no overwrite, relative paths/sizes/hashes only, no file contents)",
+    "exitCodes": {
+      "0": "success (DryRun plan valid / Apply copied and reconciled)",
+      "2": "operation failure (inventory build / robocopy / reconciliation / port rewrite / manifest write)",
+      "3": "usage or input invalid",
+      "4": "ambiguity refusal (source-dest overlap / non-empty dest / manifest path exists - before any write)",
+      "7": "PUBLICATION_DENIED (publication boundary guard)"
+    },
+    "verificationBoundary": "automation verifies with synthetic directories only (TEMP sandbox, fabricated data); Apply against real user data is an explicit operator action and is never part of agent verification"
+  },
+  "notes": [
+    "FDD layout guard: bundle refuses output containing app-local hostfxr/hostpolicy/coreclr/System.Private.CoreLib (mixed-layout startup failure, see team task t8).",
+    "Smoke runs use isolated AURACHAT_HOME/AURACHAT_DATA_DIR inside the bundle output directory; real user data is never touched.",
+    "Output directories inside the repository, the user profile, system directories, drive roots or any junction/symlink chain are refused before any write.",
+    "Data migration entry (tools/migrate-legacy.ps1) requires explicit -Source/-Dest, defaults to DryRun, and copies only with explicit -Apply; real user data is read only when the operator explicitly targets it in Apply mode, and agent verification uses synthetic directories exclusively."
+  ]
+}

@@ -20,8 +20,14 @@ internal sealed class FakeLlm : ILlmClient
     public Queue<JsonObject> Replies { get; } = new();
     public string LastPlainReply = "好的呀";
 
+    /// <summary>AskAsync 收到的 options（v3：验真提示词里有没有「现在」这一行）。</summary>
+    public List<LlmOptions> SeenOptions { get; } = [];
+
     public Task<string> AskAsync(LlmOptions options, IReadOnlyList<LlmMessage> messages, CancellationToken ct = default)
-        => Task.FromResult(LastPlainReply);
+    {
+        SeenOptions.Add(options);
+        return Task.FromResult(LastPlainReply);
+    }
 
     public async Task<JsonObject> AskMessageAsync(LlmOptions options, IReadOnlyList<LlmMessage> messages,
         JsonArray? tools = null, JsonArray? toolHistory = null, CancellationToken ct = default)

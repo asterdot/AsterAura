@@ -4,6 +4,7 @@ using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using AuraChat.Core;
 
 namespace AuraChat.App;
 
@@ -25,8 +26,9 @@ public sealed class AppApi : IDisposable
     {
         var handler = new HttpClientHandler
         {
-            // 自签证书/隧道有时证书链不全，桌面端由用户自己确认地址，这里不额外拦
-            ServerCertificateCustomValidationCallback = (_, _, _, _) => true,
+            // 默认严格校验服务器证书；自签证书/隧道链不全的场景用 AURACHAT_ALLOW_INSECURE_TLS=1 显式放开（TlsPolicy）
+            ServerCertificateCustomValidationCallback = (_, _, _, errors) =>
+                errors == System.Net.Security.SslPolicyErrors.None || TlsPolicy.AllowInsecure,
         };
         _http = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(100) };
     }
@@ -62,7 +64,7 @@ public sealed class AppApi : IDisposable
 
     private HttpRequestMessage Request(HttpMethod method, string path, JsonNode? body = null)
     {
-        var req = new HttpRequestMessage(method, BaseUrl + "/aurachat/" + path.TrimStart('/'));
+        var req = new HttpRequestMessage(method, ClientUrls.Of(BaseUrl, path));
         if (_token.Length > 0) req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _token);
         if (body is not null)
             req.Content = new StringContent(body.ToJsonString(), Encoding.UTF8, "application/json");
@@ -161,21 +163,32 @@ public sealed class AppApi : IDisposable
 
     // ---------------------------------------------------------------- 媒体
 
-    public string MediaUrl(string mediaId, string chatId = "") =>
-        $"{BaseUrl}/aurachat/api/media/{Uri.EscapeDataString(mediaId)}?token={Uri.EscapeDataString(_token)}";
+    // 媒体/头像/背景/SSE 的 URL 一律不带 token（会话凭证不进 URL、日志和 Referer），
+    // 凭证统一走 Authorization Bearer：见 ClientUrls 与 AuthedRequest。
 
-    public string StickerUrl(string md5) =>
-        $"{BaseUrl}/aurachat/api/sticker/{Uri.EscapeDataString(md5)}?token={Uri.EscapeDataString(_token)}";
+    private HttpRequestMessage AuthedRequest(HttpMethod method, string url)
+    {
+        var req = new HttpRequestMessage(method, url);
+        if (_token.Length > 0) req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _token);
+        return req;
+    }
 
-    public string AvatarUrl() => $"{BaseUrl}/aurachat/api/avatar?token={Uri.EscapeDataString(_token)}&v={DateTime.Now.Ticks}";
+    public string MediaUrl(string mediaId, string chatId = "") => ClientUrls.Media(BaseUrl, mediaId);
 
-    public string BackgroundUrl() => $"{BaseUrl}/aurachat/api/background?token={Uri.EscapeDataString(_token)}&v={DateTime.Now.Ticks}";
+    public string StickerUrl(string md5) => ClientUrls.Sticker(BaseUrl, md5);
+
+    public string AvatarUrl() => ClientUrls.Avatar(BaseUrl, DateTime.Now.Ticks);
+
+    public string BackgroundUrl() => ClientUrls.Background(BaseUrl, DateTime.Now.Ticks);
 
     public async Task<byte[]?> MediaBytesAsync(string url, CancellationToken ct = default)
     {
+        // Bearer 只发给可信 BaseUrl 下的媒体端点；别的 URL 一律不发请求也不发凭证（返回 null 走过期占位）
+        if (!ClientUrls.IsTrustedMediaUrl(BaseUrl, url)) return null;
         try
         {
-            using var resp = await _http.GetAsync(url, ct);
+            using var req = AuthedRequest(HttpMethod.Get, url);
+            using var resp = await _http.SendAsync(req, ct);
             if (!resp.IsSuccessStatusCode) return null;
             return await resp.Content.ReadAsByteArrayAsync(ct);
         }
@@ -186,6 +199,7 @@ public sealed class AppApi : IDisposable
 
     /// <summary>
     /// 订阅实时事件。只在第一次连上时返回；断线自己重连，事件通过回调抛出来。
+    /// SSE 凭证走 Authorization 头，URL 不带 token。
     /// </summary>
     public async Task ListenAsync(Func<string, JsonObject, Task> onEvent, CancellationToken ct, Action<string>? onStatus = null)
     {
@@ -194,8 +208,7 @@ public sealed class AppApi : IDisposable
         {
             try
             {
-                var url = $"{BaseUrl}/aurachat/api/stream?token={Uri.EscapeDataString(_token)}";
-                using var req = new HttpRequestMessage(HttpMethod.Get, url);
+                using var req = AuthedRequest(HttpMethod.Get, ClientUrls.Stream(BaseUrl));
                 using var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
                 if (!resp.IsSuccessStatusCode)
                 {

@@ -20,7 +20,7 @@ public sealed class ConfigStore(DataStore store, AppLog log)
   "botTag": "",
   "siteName": "",
   "pageTitle": "",
-  "web": { "host": "0.0.0.0", "port": 2332 },
+  "web": { "host": "127.0.0.1", "port": 2332 },
   "model": { "provider": "", "model": "", "reasoningEffort": "low", "baseUrl": "", "apiKey": "", "temperature": 1.0, "maxTokens": 1024, "timeoutMs": 120000 },
   "merge": { "enabled": true, "waitSec": 2.5, "maxSec": 8, "waitTypingSec": 5 },
   "sound": {
@@ -158,10 +158,39 @@ public sealed class ConfigStore(DataStore store, AppLog log)
 
     public JsonObject Current => _current;
 
+    /// <summary>本次 Load 的显式诊断：config.json 损坏/读不了时说明原因；正常为 null。绝不静默用默认值覆盖坏文件。</summary>
+    public string? LastLoadIssue { get; private set; }
+
     public ConfigStore Load()
     {
-        _current = Normalize(DataStore.ReadObject(_file));
-        return this;
+        LastLoadIssue = null;
+        var read = DataStore.ReadJsonDetailed(_file);
+        switch (read.Status)
+        {
+            case JsonReadStatus.Ok:
+                _current = Normalize(read.Node as JsonObject ?? new JsonObject());
+                return this;
+
+            case JsonReadStatus.Missing:
+                _current = Normalize(null);
+                return this;
+
+            case JsonReadStatus.Corrupted:
+                // 坏文件先原样挪走（内容一个字节都不丢），再用默认值起来 —— 上层和用户能看到明确诊断
+                var backup = _file + ".corrupt-" + DateTime.Now.ToString("yyyyMMdd-HHmmss", System.Globalization.CultureInfo.InvariantCulture);
+                try { File.Move(_file, backup); }
+                catch (Exception ex) { backup = _file; log.Child("core").Error("config.json 损坏且备份失败：" + ex.Message); }
+                LastLoadIssue = $"config.json 不是合法 JSON，已备份为 {Path.GetFileName(backup)}，本轮用默认配置启动。请检查后恢复。";
+                log.Child("core").Error(LastLoadIssue!);
+                _current = Normalize(null);
+                return this;
+
+            default: // IoError：文件还在但读不了（权限/占用）—— 绝不动它，本轮只在内存里用默认值
+                LastLoadIssue = $"config.json 读不了（{read.Error}），本轮用默认配置启动；文件保持原样。";
+                log.Child("core").Error(LastLoadIssue!);
+                _current = Normalize(null);
+                return this;
+        }
     }
 
     public JsonObject Save(JsonObject cfg)
@@ -218,7 +247,9 @@ public sealed class ConfigStore(DataStore store, AppLog log)
 
         var web = Sub(c, "web");
         web["port"] = (int)Num(web["port"], 2332, 1, 65535);
-        web["host"] = Str(web["host"], "0.0.0.0");
+        // 默认只监听 loopback（2026-11-07 安全冲刺）。旧数据里显式存的 0.0.0.0 / 局域网地址
+        // 原样保留（显式局域网绑定配置不能被静默改写），只有缺失/为空才落到新默认。
+        web["host"] = Str(web["host"], "127.0.0.1");
 
         var model = Sub(c, "model");
         if (!ReasoningEfforts.Contains(Str(model["reasoningEffort"], "low"))) model["reasoningEffort"] = "low";

@@ -2,7 +2,6 @@ using System.Text.Json.Nodes;
 using AuraChat.Core;
 using AuraChat.Core.Ai;
 using AuraChat.Core.Features;
-using AuraChat.Core.Personas;
 using AuraChat.Core.Runtime;
 using AuraChat.Features.Chat;
 
@@ -12,16 +11,44 @@ namespace AuraChat.Server.Routes;
 [RouteModule(45)]
 public static class DebugRoutes
 {
+    /// <summary>
+    /// 系统提示的逐段拆解（调试窗口用）。开头三段直接取 <see cref="ChatHub.PromptHeadParts"/> ——
+    /// 与真实请求共用同一份口径，窗口里看到的就是她真拿到的东西（v3 观察项：原来漏了「现在」）。
+    /// public 供测试直调。
+    /// </summary>
+    public static async Task<JsonArray> BuildSystemPartsAsync(FeatureHost env)
+    {
+        var systemParts = new JsonArray();
+        try
+        {
+            foreach (var (name, text) in ChatHub.PromptHeadParts(env, "private"))
+                systemParts.Add(new JsonObject { ["name"] = name, ["text"] = text });
+            if (env.Get<IMoodService>() is { } mood)
+                systemParts.Add(new JsonObject { ["name"] = "心情行", ["text"] = mood.ContextLine() });
+            foreach (var provider in env.ContextProviders)
+            {
+                foreach (var line in provider.ContextLines())
+                    systemParts.Add(new JsonObject { ["name"] = provider.GetType().Name, ["text"] = line });
+            }
+            if (env.Get<IMemoryService>() is { } mem)
+                systemParts.Add(new JsonObject { ["name"] = "记忆召回（最近一次）", ["text"] = await mem.RecallAsync(AuraChatInfo.OwnerId, "", default) });
+            if (env.Get<ContextCompressor>() is { } comp && comp.SummaryOf(AuraChatInfo.OwnerId) is { } s)
+                systemParts.Add(new JsonObject { ["name"] = "上下文压缩摘要", ["text"] = s["summary"]?.ToString() ?? "" });
+        }
+        catch (Exception ex)
+        {
+            systemParts.Add(new JsonObject { ["name"] = "（取段出错）", ["text"] = ex.Message });
+        }
+        return systemParts;
+    }
+
     public static void Register(Router r, ApiContext api)
     {
-        var personas = api.Get<PersonaService>() ?? new PersonaService(api.Store, api.PersonasRoot);
-
         r.Add("GET", "api/debug/context", async call =>
         {
             if (await api.RequireOwnerAsync(call) is null) return;
 
             var env = api.Env;
-            var cfg = api.Config.Current;
 
             var parts = new JsonObject
             {
@@ -29,37 +56,8 @@ public static class DebugRoutes
                 ["at"] = DateTimeOffset.Now.ToUnixTimeMilliseconds(),
             };
 
-            // 系统提示的每一段（人设/规则/心情/技能/记忆/压缩摘要）
-            var systemParts = new JsonArray();
-            try
-            {
-                var personaId = cfg["persona"]?["current"]?.ToString();
-                systemParts.Add(new JsonObject
-                {
-                    ["name"] = "人设",
-                    ["text"] = personas.CurrentText(personaId),
-                });
-                systemParts.Add(new JsonObject
-                {
-                    ["name"] = "规则",
-                    ["text"] = PersonaService.RulesText("private", api.Config),
-                });
-                if (env.Get<IMoodService>() is { } mood)
-                    systemParts.Add(new JsonObject { ["name"] = "心情行", ["text"] = mood.ContextLine() });
-                foreach (var provider in ((FeatureHost)env).ContextProviders)
-                {
-                    foreach (var line in provider.ContextLines())
-                        systemParts.Add(new JsonObject { ["name"] = provider.GetType().Name, ["text"] = line });
-                }
-                if (env.Get<IMemoryService>() is { } mem)
-                    systemParts.Add(new JsonObject { ["name"] = "记忆召回（最近一次）", ["text"] = await mem.RecallAsync(AuraChatInfo.OwnerId, "", default) });
-                if (env.Get<ContextCompressor>() is { } comp && comp.SummaryOf(AuraChatInfo.OwnerId) is { } s)
-                    systemParts.Add(new JsonObject { ["name"] = "上下文压缩摘要", ["text"] = s["summary"]?.ToString() ?? "" });
-            }
-            catch (Exception ex)
-            {
-                systemParts.Add(new JsonObject { ["name"] = "（取段出错）", ["text"] = ex.Message });
-            }
+            // 系统提示的每一段（人设/规则/现在/心情/技能/记忆/压缩摘要）
+            var systemParts = await BuildSystemPartsAsync(env);
             parts["systemParts"] = systemParts;
             parts["systemChars"] = systemParts.Sum(p => (p as JsonObject)?["text"]?.ToString()?.Length ?? 0);
 

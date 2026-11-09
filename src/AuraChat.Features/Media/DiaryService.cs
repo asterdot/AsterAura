@@ -163,7 +163,7 @@ public sealed class DiaryService : IDiaryService
             string speaker;
             if (who == "bot") speaker = "我";
             else if (uid == OwnerId) speaker = OwnerName;
-            else if (uid.StartsWith("guest-", StringComparison.Ordinal)) speaker = $"客人{uid[6..]}";
+            // guest- 前缀分支已退役（新版无访客机制，旧 guest- uid 会 fall-through 到 uid 原样）
             else speaker = "对方";
 
             lines.Add($"{clock} {speaker}：{text}");

@@ -7,6 +7,7 @@ using AuraChat.Core.Logging;
 using AuraChat.Core.Media;
 using AuraChat.Core.Personas;
 using AuraChat.Core.Runtime;
+using AuraChat.Features.Life;
 
 namespace AuraChat.Features.Chat;
 
@@ -251,6 +252,9 @@ public sealed class ChatHub : IChatHub
         var chatId = message.ChatId;
         lock (_gate) { _typingUntil.Remove(chatId); }
 
+        // v3：她在「收到」这一刻就点亮打字中 —— 不再等模型调用前才发，前端那段空窗也有反馈。
+        _host.Emit("typing", new JsonObject { ["chatId"] = chatId, ["on"] = true });
+
         var content = new List<string>();
         var images = new List<JsonObject>();
 
@@ -276,10 +280,29 @@ public sealed class ChatHub : IChatHub
         if (images.Count > 0)
             content.Add($"【对方发来 {images.Count} 张图片】");
 
-        if (content.Count == 0) return false;
+        if (content.Count == 0)
+        {
+            // v3：没东西可回也要把刚点亮的 typing 收掉（有轮次在说时就别收，那轮结束自己会收）
+            EmitTypingOff(chatId, alsoSkipIfBusy: true);
+            return false;
+        }
 
         Enqueue(chatId, message.UserId, message.Nickname, content, images, message.Voice is not null);
         return true;
+    }
+
+    /// <summary>
+    /// 收掉「正在输入」（v3）。下一轮已经排队时不发 —— 那一轮的入口会重新点亮 typing，
+    /// 这里再发一次 off 前端会闪一下。
+    /// </summary>
+    private void EmitTypingOff(string chatId, bool alsoSkipIfBusy = false)
+    {
+        lock (_gate)
+        {
+            if (_pending.ContainsKey(chatId)) return;
+            if (alsoSkipIfBusy && _busy.Contains(chatId)) return;
+        }
+        _host.Emit("typing", new JsonObject { ["chatId"] = chatId, ["on"] = false });
     }
 
     private async Task<string> StickerNameOfAsync(string md5)
@@ -391,7 +414,7 @@ public sealed class ChatHub : IChatHub
         catch (Exception ex)
         {
             _log.Warn("这一轮没走完：" + ex.Message);
-            _host.Emit("typing", new JsonObject { ["chatId"] = chatId, ["on"] = false });
+            EmitTypingOff(chatId);
             try { Mood?.Nudge(double.NaN, "刚才那轮出错了"); } catch { /* 忽略 */ }
         }
         finally
@@ -410,12 +433,13 @@ public sealed class ChatHub : IChatHub
         if (llm is null)
         {
             _log.Warn("模型还没配好，这轮不回了");
+            // v3：llm 缺省这条路径原来直接 return，typing 就一直挂着不灭
+            EmitTypingOff(p.ChatId);
             return;
         }
 
         var cfg = _host.Config.Current;
         var chatId = p.ChatId;
-        _host.Emit("typing", new JsonObject { ["chatId"] = chatId, ["on"] = true });
 
         var system = await BuildSystemPromptAsync(p);
         var messages = BuildMessages(p, system);
@@ -445,7 +469,7 @@ public sealed class ChatHub : IChatHub
         catch (Exception ex)
         {
             _log.Warn("模型没回话：" + ex.Message);
-            _host.Emit("typing", new JsonObject { ["chatId"] = chatId, ["on"] = false });
+            EmitTypingOff(chatId);
             return;
         }
 
@@ -470,21 +494,27 @@ public sealed class ChatHub : IChatHub
         }
     }
 
+    /// <summary>
+    /// 系统提示的固定开头三段（人设 / 规则 / 现在）。真实请求与调试窗口共用这一份口径 ——
+    /// 调试窗口原来自己拼、漏了「现在」，看到的不再是真提示词（v3 观察项）。
+    /// </summary>
+    public static List<(string Name, string Text)> PromptHeadParts(FeatureHost host, string kind)
+    {
+        var personaId = host.Config.Current["persona"]?["current"]?.ToString();
+        return
+        [
+            ("人设", host.Persona.CurrentText(personaId)),
+            ("规则", PersonaService.RulesText(kind, host.Config)),
+            // #3 时间观念：人格卡自己写着「你能感知到…现在几点」，那就把这份感官真正交给她。
+            // 只挂一个 check_clock 工具不够 —— 模型不会每轮都主动去调，于是表现得「没有时间观念」。
+            ("现在", NowLine(DateTime.Now)),
+        ];
+    }
+
     private async Task<string> BuildSystemPromptAsync(Pending p)
     {
-        var cfg = _host.Config.Current;
-        var personaId = cfg["persona"]?["current"]?.ToString();
-        var parts = new List<string>
-        {
-            _host.Persona.CurrentText(personaId),
-        };
-
         var kind = p.UserId == AuraChatInfo.OwnerId ? "private" : "social";
-        parts.Add(PersonaService.RulesText(kind, _host.Config));
-
-        // #3 时间观念：人格卡自己写着「你能感知到…现在几点」，那就把这份感官真正交给她。
-        // 只挂一个 check_clock 工具不够 —— 模型不会每轮都主动去调，于是表现得「没有时间观念」。
-        parts.Add(NowLine(DateTime.Now));
+        var parts = PromptHeadParts(_host, kind).Select(x => x.Text).ToList();
 
         if (Mood is not null)
         {
@@ -494,6 +524,19 @@ public sealed class ChatHub : IChatHub
                 if (!string.IsNullOrWhiteSpace(line)) parts.Add(line);
             }
             catch { /* 心情行拿不到不影响 */ }
+        }
+
+        // 生命状态（精力、饥饿、口渴、困倦）
+        var lifeState = _host.Get<LifeStateService>();
+        if (lifeState != null)
+        {
+            try
+            {
+                var state = lifeState.GetCurrentState();
+                var statusLine = $"【生命状态】精力 {state.Energy:F0}% | 饥饿 {state.Hunger:F0}% | 口渴 {state.Thirst:F0}% | 困倦 {state.Sleepiness:F0}%";
+                parts.Add(statusLine);
+            }
+            catch { /* 状态拿不到不影响 */ }
         }
 
         foreach (var provider in _host.ContextProviders)
@@ -672,7 +715,7 @@ public sealed class ChatHub : IChatHub
         if (parsed.Silent)
         {
             _log.Info($"{chatId}：她选择不说话");
-            _host.Emit("typing", new JsonObject { ["chatId"] = chatId, ["on"] = false });
+            EmitTypingOff(chatId);
             return;
         }
 
@@ -686,7 +729,7 @@ public sealed class ChatHub : IChatHub
             if (items.Count == 0)
             {
                 _log.Info($"{chatId}：自查后没剩下能发的话");
-                _host.Emit("typing", new JsonObject { ["chatId"] = chatId, ["on"] = false });
+                EmitTypingOff(chatId);
                 return;
             }
         }
@@ -756,7 +799,7 @@ public sealed class ChatHub : IChatHub
             }
         }
 
-        _host.Emit("typing", new JsonObject { ["chatId"] = chatId, ["on"] = false });
+        EmitTypingOff(chatId);
         LogChat(chatId, "bot", string.Join(" ", items.Select(i => i.Kind is ReplyKind.Text or ReplyKind.Voice ? i.Text : "[" + i.Kind + "]")));
 
         lock (_gate) { _lastBot[chatId] = DateTime.UtcNow; }

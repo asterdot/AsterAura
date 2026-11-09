@@ -209,8 +209,11 @@ public interface IHistoryStore
 
     void Finalize(string chatId);
 
-    /// <summary>标成已读（写 read.json 的 lastReadAt），返回之前有多少条未读。D3 已读回执用。</summary>
-    Task<int> MarkReadAsync(string chatId, CancellationToken ct = default);
+    /// <summary>
+    /// 标成已读（D3/v3）：把水位推进到 <c>min(upToT, 现在)</c>，upToT 缺省＝现在，且只前推不回退。
+    /// 返回（推进前的未读数, 推进后的水位）。
+    /// </summary>
+    Task<(int UnreadBefore, long ReadAt)> MarkReadAsync(string chatId, long? upToT = null, CancellationToken ct = default);
 
     /// <summary>对方最后的已读时间（毫秒；没读过 0）。</summary>
     long LastReadAt(string chatId);

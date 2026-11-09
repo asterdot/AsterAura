@@ -56,24 +56,44 @@ public sealed class ApiContext
 
     // ---------- 会话辅助 ----------
 
-    public SessionUser? UserOf(HttpContext ctx) => Auth.SessionUserOf(HttpUtil.TokenOf(ctx));
+    /// <summary>
+    /// 当前会话身份。会话里的 role 是签发时写死的，但主人身份的事实源是 accounts.json
+    /// （主人账号 role=owner）；这里按账本实时校正，普通账号会话不会被提升。
+    /// </summary>
+    public SessionUser? UserOf(HttpContext ctx)
+    {
+        var me = Auth.SessionUserOf(HttpUtil.TokenOf(ctx));
+        if (me is null) return null;
+        if (me.Role == "account" && Get<AccountService>()?.Find(me.Subject) is AccountInfo acc && acc.IsOwner)
+            return me with { Role = "owner", Level = "full" };
+        return me;
+    }
 
-    /// <summary>要求登录；没登录时写 {ok:false,reason:'没登录'} 并返回 null。</summary>
+    /// <summary>显示名：账号会话用 accounts.json 里的名字，旧 owner/guest 会话用 users.json。</summary>
+    public string DisplayNameOf(SessionUser me)
+        => Get<AccountService>()?.Find(me.Subject) is AccountInfo acc
+            ? (acc.DisplayName ?? acc.Username)
+            : Auth.DisplayNameOf(me.Subject);
+
+    /// <summary>
+    /// 要求登录；没登录时回 HTTP 401 + {ok:false,reason:'没登录'} 并返回 null。
+    /// 状态码与 /api/stream、媒体端点对齐（未凭证一律 401），JSON 体保持原样，老客户端照常解析。
+    /// </summary>
     public async Task<SessionUser?> RequireUserAsync(ApiCall call)
     {
         var me = UserOf(call.Http);
         if (me is not null) return me;
-        await HttpUtil.Fail(call.Http, "没登录");
+        await HttpUtil.SendAsync(call.Http, 401, """{"ok":false,"reason":"没登录"}""", "application/json; charset=utf-8");
         return null;
     }
 
-    /// <summary>要求主人；不是主人时写 {ok:false,reason:'只有主人能这么做'}。</summary>
+    /// <summary>要求主人；未登录 401，已登录但不是主人回 HTTP 403 + {ok:false,reason:'只有主人能这么做'}。</summary>
     public async Task<SessionUser?> RequireOwnerAsync(ApiCall call)
     {
         var me = await RequireUserAsync(call);
         if (me is null) return null;
         if (me.IsOwner) return me;
-        await HttpUtil.Fail(call.Http, "只有主人能这么做");
+        await HttpUtil.SendAsync(call.Http, 403, """{"ok":false,"reason":"只有主人能这么做"}""", "application/json; charset=utf-8");
         return null;
     }
 

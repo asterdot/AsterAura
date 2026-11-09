@@ -1,6 +1,7 @@
 using System.Text;
 using System.Text.Json.Nodes;
 using AuraChat.Core;
+using AuraChat.Core.Ai;
 using AuraChat.Core.Auth;
 using AuraChat.Core.Runtime;
 using AuraChat.Features.Media;
@@ -35,6 +36,9 @@ public sealed partial class MemoryService
 
     private const long DayMs = 86_400_000;
 
+    /// <summary>提炼结果特殊值：模型没配/调用失败/空响应。调用方不得因此推进巩固偏移。</summary>
+    private const int ModelUnavailable = -1;
+
     private const string ExtractSystem =
         "你从聊天记录里提炼值得长期记住的事实（关于说话的人、被提到的人或事）。" +
         "只输出 JSON 数组，元素形如 {\"text\":\"一句话\",\"importance\":0.5,\"tags\":[\"标签\"],\"about\":\"归属的人，没有就空字符串\"}。" +
@@ -61,12 +65,42 @@ public sealed partial class MemoryService
     private Task<int> ExtractFactsAsync(string subject, string transcript, CancellationToken ct)
         => ExtractFactsAsync(subject, transcript, subject == "azone" ? ExtractDiaryMax : ExtractChatMax, ct);
 
+    /// <summary>
+    /// 提炼一次事实。返回新增条数；
+    /// 模型没配、调用失败、空响应返回 ModelUnavailable(-1)——调用方要把它当「这轮没跑成」，
+    /// 不推进处理偏移，下轮重试，避免把没提炼过的聊天行静默标成已处理。
+    /// 模型应答了但不是合法 JSON（坏响应）算「没提炼出东西」，返回 0 正常推进。
+    /// </summary>
     private async Task<int> ExtractFactsAsync(string subject, string transcript, int max, CancellationToken ct)
     {
         if (transcript.Trim().Length == 0) return 0;
+        var llm = _host.Get<ILlmClient>();
+        if (llm is null) return ModelUnavailable;
         var system = ExtractSystem.Replace("{max}", max.ToString());
-        var raw = await MediaUtil.AskModelAsync(_host, system, transcript, 0.2, 900, 45_000, ct).ConfigureAwait(false);
-        if (string.IsNullOrWhiteSpace(raw)) return 0;
+
+        string? raw;
+        try
+        {
+            raw = await llm.AskAsync(new LlmOptions
+            {
+                Provider = _host.Str("model", "provider"),
+                Model = _host.Str("model", "model"),
+                System = system,
+                Temperature = 0.2,
+                MaxTokens = 900,
+                TimeoutMs = 45_000,
+            }, [new LlmMessage("user", transcript)], ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw; // 取消要往上抛，由 ConsolidateAsync 统一收尾
+        }
+        catch (Exception ex)
+        {
+            _log.Warn("提炼模型调用失败：", ex.Message);
+            return ModelUnavailable;
+        }
+        if (string.IsNullOrWhiteSpace(raw)) return ModelUnavailable;
         if (MediaUtil.ExtractJsonArray(raw) is not JsonArray arr) return 0;
 
         var added = 0;
@@ -129,25 +163,45 @@ public sealed partial class MemoryService
                 var done = (int)JsonUtil.Num(processed[day], 0);
                 if (done >= lines.Count) continue;
 
-                // 按会话分组提炼（原版按 chatId 分组后分块）
-                foreach (var group in lines.Skip(done)
-                    .GroupBy(l => JsonUtil.Str(l["chatId"], ""), StringComparer.Ordinal))
+                // 按会话连续段分组提炼（原版按 chatId 分组后分块）。每组提炼完就推进偏移并落盘：
+                // 模型挂掉只重做失败的那组，绝不把没提炼过的行标成已处理（宁可贵一点重试，不静默丢内容）
+                var progressed = false;
+                var gi = done;
+                while (gi < lines.Count)
                 {
-                    var chatId = group.Key;
-                    var isDiary = chatId == "azone";
-                    var fromUser = group.Count(l => JsonUtil.Str(l["who"], "") != "bot");
-                    if (fromUser < (isDiary ? 1 : 3)) continue; // 太短不值得提炼（原 :528 判定）
-                    var chunk = group.ToList();
-                    for (var i = 0; i < chunk.Count; i += ChunkLines)
-                    {
-                        var piece = chunk.Skip(i).Take(ChunkLines).ToList();
-                        added += await ExtractDayChunkAsync(chatId, piece, isDiary, ct).ConfigureAwait(false);
-                    }
-                }
+                    var chatId = JsonUtil.Str(lines[gi]["chatId"], "");
+                    var gj = gi;
+                    while (gj < lines.Count
+                           && string.Equals(JsonUtil.Str(lines[gj]["chatId"], ""), chatId, StringComparison.Ordinal)) gj++;
 
-                processed[day] = lines.Count;
-                days++;
-                Save();
+                    var isDiary = chatId == "azone";
+                    var fromUser = 0;
+                    for (var k = gi; k < gj; k++)
+                        if (JsonUtil.Str(lines[k]["who"], "") != "bot") fromUser++;
+
+                    if (fromUser >= (isDiary ? 1 : 3)) // 太短不值得提炼（原 :528 判定）
+                    {
+                        var extracted = await ExtractGroupAsync(chatId, lines, gi, gj, isDiary, ct).ConfigureAwait(false);
+                        if (extracted < 0)
+                        {
+                            processed[day] = gi; // 只承认这组之前的进度
+                            Save();
+                            _log.Warn($"提炼模型不可用，{day} 停在第 {gi} 行，进度已保存，下轮重试");
+                            return new JsonObject
+                            {
+                                ["ok"] = false,
+                                ["added"] = added,
+                                ["message"] = "提炼模型不可用，进度已保存，下轮重试",
+                            };
+                        }
+                        added += extracted;
+                    }
+                    gi = gj;
+                    processed[day] = gi;
+                    progressed = true;
+                    Save();
+                }
+                if (progressed) days++;
             }
 
             var forgot = ForgetPass(now);
@@ -184,13 +238,36 @@ public sealed partial class MemoryService
         {
             return new JsonObject { ["ok"] = false, ["message"] = "整理被取消" };
         }
+        catch (Exception ex)
+        {
+            // 任何意外都不外抛（Tick 的定时器不该被炸掉）；偏移已按组落盘，下轮从断点继续
+            _log.Warn("整理失败（进度已按组保存，下轮重试）：", ex.Message);
+            return new JsonObject { ["ok"] = false, ["message"] = ex.Message };
+        }
         finally
         {
             Interlocked.Exchange(ref _busy, 0);
         }
     }
 
-    /// <summary>把一段 chatlog 行拼成「说话人：内容」的文稿再提炼。</summary>
+    /// <summary>
+    /// 提炼一个会话连续段（80 行一块）。返回新增条数；模型不可用返回 ModelUnavailable(-1)，
+    /// 调用方不得推进偏移。组内中途失败时，前面块提炼出的条目已入库，下轮会重提炼整组（有相似度去重兜底）。
+    /// </summary>
+    private async Task<int> ExtractGroupAsync(string chatId, List<JsonObject> lines, int from, int to, bool isDiary, CancellationToken ct)
+    {
+        var added = 0;
+        for (var i = from; i < to; i += ChunkLines)
+        {
+            var piece = lines.GetRange(i, Math.Min(ChunkLines, to - i));
+            var r = await ExtractDayChunkAsync(chatId, piece, isDiary, ct).ConfigureAwait(false);
+            if (r < 0) return ModelUnavailable;
+            added += r;
+        }
+        return added;
+    }
+
+    /// <summary>把一段 chatlog 行拼成「说话人：内容」的文稿再提炼。返回新增条数；模型不可用返回 ModelUnavailable(-1)。</summary>
     private async Task<int> ExtractDayChunkAsync(string chatId, List<JsonObject> piece, bool isDiary, CancellationToken ct)
     {
         var sb = new StringBuilder();
@@ -332,6 +409,21 @@ public sealed partial class MemoryService
     /// </summary>
     private async Task<JsonObject> CompressIfNeededAsync(bool force, CancellationToken ct)
     {
+        // Tick 和整理收尾都可能调到这里：同时只跑一轮，防两轮拿同一批未分级条目互相覆盖
+        if (Interlocked.CompareExchange(ref _compressBusy, 1, 0) != 0)
+            return new JsonObject { ["ok"] = true, ["skipped"] = true, ["message"] = "已有一轮压缩在跑" };
+        try
+        {
+            return await CompressIfNeededLockedBodyAsync(force, ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _compressBusy, 0);
+        }
+    }
+
+    private async Task<JsonObject> CompressIfNeededLockedBodyAsync(bool force, CancellationToken ct)
+    {
         var everyHours = Math.Max(1, _host.Int(6, "memory", "compressEveryHours"));
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         var last = Load()["lastCompress"] as JsonObject;
@@ -343,7 +435,8 @@ public sealed partial class MemoryService
             .Where(m => !MemoryText.IsInvalid(m))
             .Where(m => JsonUtil.Str(m["grade"], "").Length == 0)
             .Where(m => !(MemoryText.Source(m) == "event" && now - MemoryText.At(m) < DayMs)) // 24h 内经历不压（原 :703）
-            .OrderByDescending(MemoryText.At)
+            .OrderBy(MemoryText.At)                                // 最旧的先压（原 :715 口径），新记忆等它老一老
+            .ThenBy(m => MemoryText.Id(m), StringComparer.Ordinal) // 同毫秒按 id 稳定排序，批次可复现
             .Take(CompressBatch)
             .ToList();
 
@@ -368,6 +461,23 @@ public sealed partial class MemoryService
                 var line = JsonUtil.Str(o["brief"], "").Trim();
                 if (idx >= 0 && idx < batch.Count && line.Length > 0) briefs[idx] = line;
             }
+
+        // 模型空/坏响应：一条可用缩写都没拿到就不动任何条目。分级一旦写上就不会再重压，
+        // 宁可这轮跳过（记 failed 退避，下个窗口或 force 重试），也不能把整批记忆静默降级成机械截断。
+        if (briefs.Count == 0)
+        {
+            lock (_gate)
+            {
+                var rec = Map("lastCompress");
+                rec["at"] = now; // 记失败时间：按 compressEveryHours 退避，不让 Tick 每分钟轰炸模型
+                rec["failed"] = true;
+                rec["reason"] = string.IsNullOrWhiteSpace(raw) ? "模型空响应" : "模型响应无法解析";
+                rec["made"] = 0;
+                Save();
+            }
+            _log.Warn("压缩分级跳过：模型没给出可用缩写（记忆条目未动，下轮重试）");
+            return new JsonObject { ["ok"] = false, ["skipped"] = true, ["message"] = "压缩模型无可用响应" };
+        }
 
         var gradeFull = _host.Num(0.7, "memory", "gradeFull");
         var gradeBrief = _host.Num(0.3, "memory", "gradeBrief");
@@ -423,6 +533,8 @@ public sealed partial class MemoryService
     {
         var rec = Map("lastCompress");
         rec["at"] = now;
+        rec.Remove("failed"); // 成功（或确认没活干）就清掉失败标记
+        rec.Remove("reason");
         rec["full"] = full;
         rec["brief"] = brief;
         rec["kw"] = kw;
@@ -453,7 +565,18 @@ public sealed partial class MemoryService
                     Save();
                     // 04:00 这类凌晨时段只整理到昨天；中午及以后的时段连今天上午一起整理
                     var includeToday = TimeToMinutes(s) >= 720;
-                    await ConsolidateAsync(includeToday, false, ct).ConfigureAwait(false);
+                    var r = await ConsolidateAsync(includeToday, false, ct).ConfigureAwait(false);
+                    // 整理没跑成（模型挂了/被取消/撞车）就摘掉标记，下个 tick 重试；
+                    // 处理偏移是按组落盘的，重试从断点继续，不会重复提炼
+                    if (!((bool?)r["ok"] ?? false))
+                    {
+                        lock (_gate)
+                        {
+                            var rr = Map("runs");
+                            if (JsonUtil.Str(rr[hhmm], "") == ChatLog.DayKey(now)) rr.Remove(hhmm);
+                            Save();
+                        }
+                    }
                 }
                 break;
             }
@@ -480,12 +603,13 @@ public sealed partial class MemoryService
             Math.Clamp(importance, 0, 1), "tool", "");
     }
 
-    /// <summary>清空召回日志（测试按钮用）。</summary>
+    /// <summary>清空召回日志（测试按钮用）。内存和落盘一起清。</summary>
     public void ClearRecalls()
     {
         lock (_gate)
         {
             _recallLog.Clear();
+            PersistRecallLogLocked();
             Save();
         }
     }

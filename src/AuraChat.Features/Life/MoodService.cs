@@ -118,12 +118,40 @@ public sealed partial class MoodService : IMoodService
             while (hist.Count > 60) hist.RemoveAt(0);
             _state["history"] = hist;
             DataStore.WriteJson(_file, _state);
+            // 双源同步：读优先 life（state.json），写也同步回 life，保证对称
+            // 在锁外调用 UpdateHormones 可避免潜在的 lock 顺序问题；to 是值类型（record struct），副本安全
+            var hormonesToSync = to;
+            var reasonToSync = reason;
+            try
+            {
+                _host.Get<LifeStateService>()?.UpdateHormones(hormonesToSync, reasonToSync);
+            }
+            catch (Exception syncEx)
+            {
+                // 同步失败不影响主流程；mood.json 已落盘
+                Log.Warn($"同步激素到 state.json 失败：{syncEx.Message}");
+            }
         }
     }
 
-    /// <summary>把落盘值按半衰期衰减到「现在」；mood.decay=false 时不衰减。</summary>
+    /// <summary>把落盘值按半衰期衰减到「现在」；mood.decay=false 时不衰减。优先从 LifeStateService 读取。</summary>
     private Hormones Current()
     {
+        // 优先从 LifeStateService 读取（如果已注册且启用）
+        var lifeState = _host.Get<LifeStateService>();
+        if (lifeState != null)
+        {
+            try
+            {
+                return lifeState.GetCurrentHormones();
+            }
+            catch (Exception ex)
+            {
+                Log.Warn($"从 LifeStateService 读取激素失败，降级到 mood.json: {ex.Message}");
+            }
+        }
+        
+        // 降级到原实现（向后兼容，支持独立运行）
         Hormones saved;
         long at;
         lock (_gate)

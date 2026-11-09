@@ -36,7 +36,7 @@ public static class AzoneRoutes
             var result = diary.AddComment(
                 b["entryId"]?.ToString() ?? "",
                 me.Subject,
-                api.Auth.DisplayNameOf(me.Subject),
+                api.DisplayNameOf(me),
                 b["text"]?.ToString()?.Trim() ?? "");
 
             // 留言后让她去看一眼（原版同款 fire-and-forget）
@@ -97,7 +97,7 @@ public static class AzoneRoutes
                 b["entryId"]?.ToString() ?? "",
                 b["commentId"]?.ToString() ?? "",
                 me.Subject,
-                api.Auth.DisplayNameOf(me.Subject),
+                api.DisplayNameOf(me),
                 b["text"]?.ToString()?.Trim() ?? "");
 
             _ = Task.Run(async () =>

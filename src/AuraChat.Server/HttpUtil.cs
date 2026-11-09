@@ -25,6 +25,10 @@ public static class HttpUtil
     public static Task JsonAsync(HttpContext ctx, object body)
         => SendAsync(ctx, 200, JsonSerializer.Serialize(body), "application/json; charset=utf-8");
 
+    /// <summary>带状态码的 JSON 响应（现有重载默认 200 不变）。</summary>
+    public static Task JsonAsync(HttpContext ctx, int status, JsonNode? body)
+        => SendAsync(ctx, status, body?.ToJsonString() ?? "null", "application/json; charset=utf-8");
+
     public static Task Fail(HttpContext ctx, string reason) => JsonAsync(ctx, new JsonObject { ["ok"] = false, ["reason"] = reason });
 
     /// <summary>发二进制（图片/音频/图标）。带 ETag 时支持 304。</summary>
@@ -117,15 +121,42 @@ public static class HttpUtil
         _ => "application/octet-stream",
     };
 
+    /// <summary>
+    /// host 字符串 → 监听地址。空值和解析不了的值一律退回 loopback：
+    /// 配置写错时宁可缩在小圈里，也不能悄悄把服务暴露到所有网卡。
+    /// </summary>
     public static IPAddress ParseHost(string host)
     {
-        if (string.IsNullOrWhiteSpace(host)) return IPAddress.Any;
+        if (string.IsNullOrWhiteSpace(host)) return IPAddress.Loopback;
         return host.Trim() switch
         {
             "0.0.0.0" or "*" or "any" => IPAddress.Any,
             "::" => IPAddress.IPv6Any,
             "localhost" or "127.0.0.1" => IPAddress.Loopback,
-            _ => IPAddress.TryParse(host.Trim(), out var ip) ? ip : IPAddress.Any,
+            _ => IPAddress.TryParse(host.Trim(), out var ip) ? ip : IPAddress.Loopback,
         };
+    }
+
+    /// <summary>
+    /// 旧版 URL ?token= 的兼容截止时间（UTC，含当天）。随 2.1 候选发布起算，给还拿着旧链接的客户端
+    /// 一个明确的迁移窗口；过了这个点 query token 直接按无凭证处理（401），不再兜底。
+    /// 兼容不是永久的：URL 里的会话凭证会落进日志/历史/Referer，这条通道必须死。
+    /// </summary>
+    public static readonly DateTimeOffset QueryTokenCompatUntil = new(2026, 12, 1, 23, 59, 59, TimeSpan.Zero);
+
+    public static bool QueryTokenExpired(DateTimeOffset now) => now > QueryTokenCompatUntil;
+
+    /// <summary>
+    /// 会话凭证候选：Authorization Bearer / cookie oc_s 优先（TokenOf）；
+    /// 旧版 URL ?token= 只是有界兼容兜底，排最后，命中时由调用方打日志提醒迁移。
+    /// 兼容窗口（QueryTokenCompatUntil）过后返回 (null, true)：仍能区分「用了旧通道」打日志，但一律 401。
+    /// </summary>
+    public static (string? Token, bool FromQuery) SessionTokenOf(HttpContext ctx, DateTimeOffset? now = null)
+    {
+        var t = TokenOf(ctx);
+        if (!string.IsNullOrEmpty(t)) return (t, false);
+        var q = Query(ctx, "token");
+        if (string.IsNullOrEmpty(q)) return (null, false);
+        return QueryTokenExpired(now ?? DateTimeOffset.UtcNow) ? (null, true) : (q, true);
     }
 }

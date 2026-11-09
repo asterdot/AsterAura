@@ -40,13 +40,42 @@ public sealed class AuthService(DataStore store, Logging.AppLog log)
     private readonly string _sessionsFile = store.PathIn("web-sessions.json");
     private readonly Lock _gate = new();
 
+    /// <summary>users.json 损坏/读不了时的显式诊断；正常为 null。此时绝不静默重建账号文件（否则坏文件会被新主人覆盖）。</summary>
+    public string? AccountFileIssue { get; private set; }
+
     // ---------- 账号文件 ----------
 
-    private JsonObject LoadUsers() => DataStore.ReadObject(_usersFile, new JsonObject { ["owner"] = null, ["guests"] = new JsonObject() });
+    private JsonObject LoadUsers()
+    {
+        var read = DataStore.ReadJsonDetailed(_usersFile);
+        switch (read.Status)
+        {
+            case JsonReadStatus.Ok:
+                AccountFileIssue = null;
+                return read.Node as JsonObject ?? new JsonObject();
+            case JsonReadStatus.Missing:
+                AccountFileIssue = null;
+                return new JsonObject { ["owner"] = null, ["guests"] = new JsonObject() };
+            default:
+                // 损坏/读不了：保持显式故障状态。账号看不见比被空默认值顶掉再被覆盖安全得多。
+                AccountFileIssue = read.Status == JsonReadStatus.Corrupted
+                    ? "users.json 不是合法 JSON，拒绝重建；请先恢复或手工移走该文件。"
+                    : $"users.json 读不了（{read.Error}），拒绝读写账号；请先恢复文件访问。";
+                log.Child("auth").Error(AccountFileIssue!);
+                return new JsonObject { ["owner"] = null, ["guests"] = new JsonObject() };
+        }
+    }
 
     private void SaveUsers(JsonObject users) => DataStore.WriteJson(_usersFile, users);
 
-    private JsonObject LoadSessions() => DataStore.ReadObject(_sessionsFile, new JsonObject());
+    private JsonObject LoadSessions()
+    {
+        // 会话文件损坏 = 全部会话失效（安全方向的降级，重新登录即可），但要留下显式诊断
+        var read = DataStore.ReadJsonDetailed(_sessionsFile);
+        if (read.Status is JsonReadStatus.Corrupted or JsonReadStatus.IoError)
+            log.Child("auth").Error($"web-sessions.json {read.Status}（{read.Error}），现有会话全部视为失效，需要重新登录。");
+        return read.Node as JsonObject ?? new JsonObject();
+    }
 
     private void SaveSessions(JsonObject sessions) => DataStore.WriteJson(_sessionsFile, sessions);
 
@@ -82,7 +111,11 @@ public sealed class AuthService(DataStore store, Logging.AppLog log)
     {
         get
         {
-            lock (_gate) return LoadUsers()["owner"] is null;
+            lock (_gate)
+            {
+                var users = LoadUsers();
+                return AccountFileIssue is null && users["owner"] is null;
+            }
         }
     }
 
@@ -93,6 +126,7 @@ public sealed class AuthService(DataStore store, Logging.AppLog log)
         lock (_gate)
         {
             var users = LoadUsers();
+            if (AccountFileIssue is not null) return (false, AccountFileIssue);
             if (users["owner"] is not null) return (false, "已经有主人了");
             if (string.IsNullOrEmpty(username) || string.IsNullOrEmpty(password)) return (false, "用户名和密码都不能为空");
             if (password!.Length < 6) return (false, "密码至少 6 位");
@@ -121,6 +155,7 @@ public sealed class AuthService(DataStore store, Logging.AppLog log)
         lock (_gate)
         {
             var users = LoadUsers();
+            if (AccountFileIssue is not null) return (false, AccountFileIssue, null);
             var candidates = new List<Account?>();
             if (users["owner"] is JsonObject owner) candidates.Add(ToAccount("owner", owner));
             if (GuestsOf(users) is JsonObject guests)
@@ -154,7 +189,8 @@ public sealed class AuthService(DataStore store, Logging.AppLog log)
         }
     }
 
-    public SessionUser? SessionUserOf(string? token)
+    /// <summary>now 仅供测试注入（验证 30 天 TTL 过期语义）。</summary>
+    public SessionUser? SessionUserOf(string? token, DateTimeOffset? now = null)
     {
         if (string.IsNullOrEmpty(token)) return null;
         lock (_gate)
@@ -162,7 +198,7 @@ public sealed class AuthService(DataStore store, Logging.AppLog log)
             var sessions = LoadSessions();
             if (sessions[token] is not JsonObject rec) return null;
             var at = (long)(rec["at"]?.GetValue<double>() ?? 0);
-            if (DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - at > (long)AuraChatInfo.SessionTtl.TotalMilliseconds)
+            if ((now ?? DateTimeOffset.UtcNow).ToUnixTimeMilliseconds() - at > (long)AuraChatInfo.SessionTtl.TotalMilliseconds)
             {
                 sessions.Remove(token);
                 SaveSessions(sessions);
@@ -187,6 +223,40 @@ public sealed class AuthService(DataStore store, Logging.AppLog log)
         }
     }
 
+    // ---------- 浏览器桥接票（网页端 openInBrowser 用）----------
+    // 会话凭证不进 URL：新窗口/系统浏览器先拿一张短时一次性票，回页后立刻换成真会话。
+    // 票本身 60 秒过期、只能用一次，泄漏窗口极小，也不会成为长期凭证。
+
+    /// <summary>桥接票有效期（秒）。</summary>
+    public const int BridgeTicketTtlSeconds = 60;
+
+    private readonly Dictionary<string, (string Token, long Exp)> _bridges = new(StringComparer.Ordinal);
+
+    public string IssueBridgeTicket(string sessionToken)
+    {
+        var ticket = Convert.ToHexString(RandomNumberGenerator.GetBytes(32)).ToLowerInvariant();
+        lock (_gate)
+        {
+            var now = Now();
+            foreach (var key in _bridges.Where(kv => kv.Value.Exp <= now).Select(kv => kv.Key).ToList())
+                _bridges.Remove(key);
+            _bridges[ticket] = (sessionToken, now + BridgeTicketTtlSeconds * 1000);
+        }
+        return ticket;
+    }
+
+    /// <summary>换票：一次性（用掉即焚）+ 过期作废。now 仅供测试注入。</summary>
+    public string? ConsumeBridgeTicket(string? ticket, DateTimeOffset? now = null)
+    {
+        if (string.IsNullOrEmpty(ticket)) return null;
+        lock (_gate)
+        {
+            var ts = (now ?? DateTimeOffset.UtcNow).ToUnixTimeMilliseconds();
+            if (!_bridges.Remove(ticket!, out var rec)) return null;
+            return rec.Exp <= ts ? null : rec.Token;
+        }
+    }
+
     // ---------- 客人 ----------
 
     public JsonObject? OwnerInfo()
@@ -203,92 +273,11 @@ public sealed class AuthService(DataStore store, Logging.AppLog log)
         }
     }
 
-    public List<JsonObject> ListGuests()
-    {
-        lock (_gate)
-        {
-            var list = new List<JsonObject>();
-            if (GuestsOf(LoadUsers()) is not JsonObject guests) return list;
-            foreach (var (subject, node) in guests)
-            {
-                if (node is not JsonObject g) continue;
-                list.Add(new JsonObject
-                {
-                    ["subject"] = g["subject"]?.ToString() ?? subject,
-                    ["role"] = g["role"]?.ToString() ?? "guest",
-                    ["id"] = g["id"]?.DeepClone(),
-                    ["username"] = g["username"]?.DeepClone(),
-                    ["displayName"] = g["displayName"]?.DeepClone(),
-                    ["note"] = g["note"]?.DeepClone(),
-                    ["level"] = g["level"]?.ToString() ?? "social",
-                });
-            }
-            return list;
-        }
-    }
+    // ListGuests 已退役（新版无访客机制）
 
-    public (bool Ok, string? Reason, string? Subject, int Id, string? Username, string? Password) CreateGuest(
-        string? username, string? displayName, string? note, string? level)
-    {
-        lock (_gate)
-        {
-            var users = LoadUsers();
-            if (users["owner"] is null) return (false, "还没有主人", null, 0, null, null);
-            if (string.IsNullOrEmpty(username)) return (false, "用户名不能为空", null, 0, null, null);
+    // CreateGuest 已退役（新版无访客机制）
 
-            var guests = GuestsOf(users) ?? new JsonObject();
-            users["guests"] = guests;
-
-            var ids = guests.Select(kv => kv.Value?["id"] is JsonNode n ? (int)n.GetValue<double>() : 0).ToList();
-            var id = ids.Count > 0 ? ids.Max() + 1 : 1;
-            var subject = "guest-" + id;
-            var password = Convert.ToHexString(RandomNumberGenerator.GetBytes(4)).ToLowerInvariant();
-            var salt = NewSalt();
-
-            guests[subject] = new JsonObject
-            {
-                ["subject"] = subject,
-                ["role"] = "guest",
-                ["id"] = id,
-                ["username"] = username,
-                ["displayName"] = string.IsNullOrEmpty(displayName) ? username : displayName,
-                ["note"] = note ?? "",
-                ["level"] = level == "full" ? "full" : "social",
-                ["salt"] = salt,
-                ["hash"] = HashPassword(password, salt),
-                ["algorithm"] = "pbkdf2",
-                ["createdAt"] = Now(),
-            };
-            SaveUsers(users);
-            return (true, null, subject, id, username, password);
-        }
-    }
-
-    public (bool Ok, string? Reason) UpdateGuest(string subject, JsonObject body)
-    {
-        lock (_gate)
-        {
-            var users = LoadUsers();
-            if (GuestsOf(users)?[subject] is not JsonObject g) return (false, "没有这个客人");
-
-            if (body.ContainsKey("displayName")) g["displayName"] = body["displayName"]?.ToString();
-            if (body.ContainsKey("note")) g["note"] = body["note"]?.ToString();
-            if (body.ContainsKey("username") && !string.IsNullOrEmpty(body["username"]?.ToString())) g["username"] = body["username"]!.ToString();
-            var level = body["level"]?.ToString();
-            if (level is "full" or "social") g["level"] = level;
-            if (body["password"] is JsonNode pw && !string.IsNullOrEmpty(pw.ToString()))
-            {
-                var password = pw.ToString();
-                if (password.Length < 6) return (false, "密码至少 6 位");
-                var salt = NewSalt();
-                g["salt"] = salt;
-                g["hash"] = HashPassword(password, salt);
-                g["algorithm"] = "pbkdf2";
-            }
-            SaveUsers(users);
-            return (true, null);
-        }
-    }
+    // UpdateGuest 已退役（新版无访客机制）
 
     public (bool Ok, string? Reason) ChangePassword(string subject, string? oldPassword, string? newPassword)
     {
@@ -310,20 +299,21 @@ public sealed class AuthService(DataStore store, Logging.AppLog log)
         }
     }
 
-    public (bool Ok, string? Reason) DeleteGuest(string subject)
+    // DeleteGuest 已退役（新版无访客机制）
+
+    /// <summary>
+    /// 该 subject 是否为旧 users.json 里的身份（主人或客人）。
+    /// 用途：把「旧身份会话」和「账号会话（accounts.json 里的账号）」区分开——
+    /// 旧身份不是账号，不进账号面（404）；账号被删的孤儿会话要重新登录（401）。
+    /// </summary>
+    public bool IsLegacySubject(string subject)
     {
+        if (string.IsNullOrEmpty(subject)) return false;
         lock (_gate)
         {
             var users = LoadUsers();
-            if (GuestsOf(users)?[subject] is null) return (false, "没有这个客人");
-            (GuestsOf(users)!).Remove(subject);
-            SaveUsers(users);
-
-            var sessions = LoadSessions();
-            foreach (var (token, rec) in sessions.ToList())
-                if (rec?["subject"]?.ToString() == subject) sessions.Remove(token);
-            SaveSessions(sessions);
-            return (true, null);
+            if (subject == "owner") return users["owner"] is JsonObject;
+            return GuestsOf(users)?[subject] is JsonObject;
         }
     }
 

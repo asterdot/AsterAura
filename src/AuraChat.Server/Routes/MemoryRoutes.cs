@@ -1,4 +1,5 @@
 using System.Text.Json.Nodes;
+using AuraChat.Core.Auth;
 using AuraChat.Core.Features;
 
 namespace AuraChat.Server.Routes;
@@ -61,10 +62,12 @@ public static class MemoryRoutes
 
             var b = await HttpUtil.ReadBodyAsync(call.Http);
             var about = b["about"]?.ToString()?.Trim() ?? "";
-            if (about.Length > 0 && about != "owner" && !about.StartsWith("guest-", StringComparison.Ordinal))
+            if (about.Length > 0 && about != "owner")
             {
-                var hit = api.Auth.ListGuests().FirstOrDefault(g => string.Equals(g["username"]?.ToString(), about, StringComparison.Ordinal));
-                if (hit is not null) about = hit["subject"]?.ToString() ?? about;
+                // 账号用户名 → accountId（按账号账本查找，访客机制已退役）
+                var acc = api.Get<AccountService>()?.FindByUsername(about);
+                if (acc is not null) about = acc.AccountId;
+                // 注意：传入 "guest-*" 字符串会直接作为 about 键使用（只读兼容，不做映射）
             }
             await HttpUtil.JsonAsync(call.Http, memory.SetProfile(about, b["text"]?.ToString() ?? "", b["name"]?.ToString() ?? ""));
         });

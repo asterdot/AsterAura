@@ -16,6 +16,11 @@ export function createMoodView(ctx) {
     loadMood()
   }
 
+  // 心情与生命状态合并后：把心情内容渲染进指定容器（不重画外壳）
+  async function renderMoodInto(box) {
+    await loadMood(box)
+  }
+
   function applyKeys(el, patch, key) {
     const parts = key.split('.')
     let o = patch
@@ -33,8 +38,8 @@ export function createMoodView(ctx) {
       '</div>'
   }
 
-  async function loadMood() {
-    const body = ctx.$('#pane-body')
+  async function loadMood(root) {
+    const body = root || ctx.$('#pane-body')
     if (!body) return
     const r = await ctx.api('/api/mood')
     if (!r.ok) { body.innerHTML = '<div class="empty">' + esc(r.reason || '读不到') + '</div>'; return }
@@ -57,6 +62,7 @@ export function createMoodView(ctx) {
         '<span class="muted" style="font-size:12px">每轮结束后让模型读一遍</span></div></div>' +
         '<div class="row"><label>自动回落</label><div class="ctl"><label class="switch"><input type="checkbox" data-mkey="mood.decay" /><span class="slider"></span></label>' +
         '<span class="muted" style="font-size:12px">关掉就停在当前值不动</span></div></div>' +
+        '<div class="row"><div class="ctl"><button id="mood-save" class="primary small">保存</button></div></div>' +
         '<div class="row"><div class="ctl"><button class="ghost small" data-mood-reset>重置到平常</button></div></div>' +
         '</div></div>' : '') +
       '<div class="section"><h3>变化记录</h3><div class="body">' +
@@ -76,7 +82,7 @@ export function createMoodView(ctx) {
       '</div></div>'
 
     if (ctx.isOwner() && cfg) {
-      ctx.$$('#pane-body [data-mkey]').forEach((el) => {
+      ctx.$$('[data-mkey]', body).forEach((el) => {
         const v = el.dataset.mkey.split('.').reduce((o, k) => (o == null ? o : o[k]), cfg)
         if (el.type === 'checkbox') el.checked = Boolean(v)
         else if (v != null) el.value = v
@@ -85,19 +91,19 @@ export function createMoodView(ctx) {
     body.onclick = async (e) => {
       if (e.target.closest('#mood-save')) {
         const patch = {}
-        ctx.$$('#pane-body [data-mkey]').forEach((el) => applyKeys(el, patch, el.dataset.mkey))
+        ctx.$$('[data-mkey]', body).forEach((el) => applyKeys(el, patch, el.dataset.mkey))
         const r2 = await ctx.api('/api/config', { method: 'PATCH', body: patch })
         ctx.toast(r2.ok ? '存好了' : (r2.reason || '没存上'), r2.ok ? '' : 'err')
-        if (r2.ok) { ctx.setCfg(r2.config); loadMood() }
+        if (r2.ok) { ctx.setCfg(r2.config); loadMood(body) }
         return
       }
       if (e.target.closest('[data-mood-reset]')) {
         await ctx.api('/api/mood', { method: 'POST', body: { reset: true } })
-        loadMood()
+        loadMood(body)
         ctx.refreshMoodPill()
       }
     }
   }
 
-  return { renderMood, loadMood }
+  return { renderMood, renderMoodInto, loadMood }
 }

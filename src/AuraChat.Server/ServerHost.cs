@@ -65,6 +65,8 @@ public sealed class ServerHost(ApiContext api, AppLog log) : IAsyncDisposable
             BoundPort = port;
             api.Sse.StartHeartbeat(TimeSpan.FromSeconds(25));
             _log.Info($"服务已启动 http://{host}:{port}/");
+            if (!IPAddress.Loopback.Equals(HttpUtil.ParseHost(host)) && !IPAddress.IPv6Loopback.Equals(HttpUtil.ParseHost(host)))
+                _log.Warn($"服务监听在 {host}:{port}，局域网内的设备都能访问。只在本机用的话，把设置里的监听地址改回 127.0.0.1。");
             return (true, null);
         }
         catch (Exception ex)
@@ -88,7 +90,7 @@ public sealed class ServerHost(ApiContext api, AppLog log) : IAsyncDisposable
     public async Task RebindAsync()
     {
         var host = api.Str("web", "host");
-        if (string.IsNullOrWhiteSpace(host)) host = "0.0.0.0";
+        if (string.IsNullOrWhiteSpace(host)) host = "127.0.0.1";
         var port = (int)api.Num(2332, "web", "port");
         await StartAsync(host, port);
     }
@@ -110,7 +112,10 @@ public sealed class ServerHost(ApiContext api, AppLog log) : IAsyncDisposable
 
             if (pathname == prefix + "/api/stream")
             {
-                var me = api.Auth.SessionUserOf(HttpUtil.Query(ctx, "token"));
+                // 凭证走 Authorization/cookie；旧版 URL ?token= 只是有界兼容兜底，命中就提醒迁移
+                var (token, fromQuery) = HttpUtil.SessionTokenOf(ctx);
+                if (fromQuery) _log.Warn("SSE 连接用了旧版 URL ?token= 兼容，会话凭证不该出现在 URL 里，请更新客户端改用 Authorization");
+                var me = api.Auth.SessionUserOf(token);
                 if (me is null)
                 {
                     await HttpUtil.SendAsync(ctx, 401, "{\"ok\":false,\"reason\":\"没登录\"}", "application/json; charset=utf-8");
@@ -141,7 +146,8 @@ public sealed class ServerHost(ApiContext api, AppLog log) : IAsyncDisposable
         var handler = Router.Match(ctx.Request.Method, p);
         if (handler is null)
         {
-            await HttpUtil.JsonAsync(ctx, new JsonObject { ["ok"] = false, ["reason"] = "不认识这个接口：" + p });
+            // 未知路由返回 404（响应体结构不变），让客户端能从状态码区分「接口不存在」与「接口内业务失败」
+            await HttpUtil.JsonAsync(ctx, 404, new JsonObject { ["ok"] = false, ["reason"] = "不认识这个接口：" + p });
             return;
         }
         try

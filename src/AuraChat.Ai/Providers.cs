@@ -143,7 +143,7 @@ public static class Providers
 }
 
 /// <summary>一次调用最终用到的地址 / 密钥 / 模型（provider 预设 + 配置合并后的结果）。</summary>
-internal sealed record Endpoint(
+public sealed record Endpoint(
     string ProviderId,
     string ProviderName,
     string BaseUrl,

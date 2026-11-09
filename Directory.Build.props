@@ -1,0 +1,9 @@
+<Project>
+  <!-- 可重复构建: 把各工程的绝对路径映射为稳定路径, 消除产物内嵌的本机目录
+       (否则跨目录/跨机器重建的 DLL 因内嵌路径与 PE 时间戳哈希不同而哈希不一致)
+       t4 / release-client, 2026-11-07 -->
+  <PropertyGroup>
+    <Deterministic>true</Deterministic>
+    <PathMap>$(MSBuildProjectDirectory)=/aura/$(MSBuildProjectName)</PathMap>
+  </PropertyGroup>
+</Project>

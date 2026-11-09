@@ -95,11 +95,35 @@
 
       <form id="gate-form" class="hidden" autocomplete="off">
         <p id="gate-hello" class="muted"></p>
-        <input id="g-username" type="text" placeholder="用户名（区分大小写）" autocomplete="username" />
+        <input id="g-username" type="text" placeholder="用户名" autocomplete="username" />
         <input id="g-password" type="password" placeholder="密码" autocomplete="current-password" />
+        <label class="remember-row" style="display:flex;gap:6px;align-items:center;font-size:13px;color:#999;margin:2px 0"><input type="checkbox" id="g-remember" checked /> 记住我（下次打开自动登录）</label>
         <button id="g-submit" type="submit" class="primary">登录</button>
         <p class="gate-msg" id="gate-msg"></p>
       </form>
+
+      <!-- 注册（登录优先流的常驻入口）：本地账号，与旧账号迁移兼容面无关 -->
+      <form id="reg-form" class="hidden" autocomplete="off">
+        <p class="muted">创建一个本地账号，Ta 只属于你。</p>
+        <input id="r-username" type="text" placeholder="用户名（最多 40 字符）" maxlength="40" autocomplete="username" />
+        <input id="r-password" type="password" placeholder="密码（至少 6 位）" autocomplete="new-password" />
+        <button id="r-submit" type="submit" class="primary">注册并继续</button>
+        <p class="gate-msg" id="reg-msg"></p>
+      </form>
+
+      <!-- 角色创建：账号认证后无陪伴角色时的分流页 -->
+      <form id="comp-form" class="hidden" autocomplete="off">
+        <p class="muted" id="comp-hello"></p>
+        <input id="c-name" type="text" placeholder="给这个陪伴角色起个名字（可留空）" maxlength="40" />
+        <button id="c-submit" type="submit" class="primary">创建角色并进入</button>
+        <p class="gate-msg" id="comp-msg"></p>
+      </form>
+
+      <div id="gate-links" class="gate-links hidden">
+        <a href="#" id="link-toggle">没有账号？注册一个</a>
+        <a href="#" id="link-legacy">本机旧账号登录</a>
+        <a href="#" id="link-wizard">第一次使用？按向导初始化</a>
+      </div>
     </div>
   </div>
 

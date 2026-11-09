@@ -17,19 +17,22 @@ public static class LifeModule
     {
         var gaps = new GapPool(host.Store, () => host.Cfg, host.Log.Child("gaps"));
         var memory = new MemoryService(host);
+        var lifeState = new LifeStateService(host);
         var mood = new MoodService(host, gaps);
         var skills = new SkillService(host.Store, host.Log.Child("skills"));
 
         host.Set(gaps);
         host.Set<IMemoryService>(memory);
+        host.Set(lifeState);
         host.Set<IMoodService>(mood);
         host.Set(skills);
 
         RegisterTools(host, memory, gaps, skills);
 
-        // 状态面板：记忆 / 心情 / 缺口
+        // 状态面板：记忆 / 心情 / 生命状态 / 心事
         host.AddStatus(new StatusProvider("记忆", () => memory.Stats()));
         host.AddStatus(new StatusProvider("心情", () => mood.State()));
+        host.AddStatus(new StatusProvider("生命状态", () => lifeState.StateSnapshot()));
         host.AddStatus(new StatusProvider("心事", () => new JsonObject
         {
             ["enabled"] = gaps.Enabled,
@@ -48,6 +51,11 @@ public static class LifeModule
         {
             mood.Reset();
             return Task.FromResult(new JsonObject { ["ok"] = true, ["message"] = "心情已清零" });
+        }));
+        host.AddTest(new TestAction("生命状态：重置为基线", () =>
+        {
+            lifeState.Reset();
+            return Task.FromResult(new JsonObject { ["ok"] = true, ["message"] = "生命状态已重置为基线" });
         }));
         host.AddTest(new TestAction("心事：清空", () =>
         {

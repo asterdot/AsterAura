@@ -7,7 +7,8 @@ namespace AuraChat.Server.Routes;
 
 /// <summary>
 /// 媒体 / 表情 / 头像 / 背景（对齐原 web/routes/media.js 的 11 条接口）。
-/// &lt;img&gt;/&lt;audio&gt; 没法带 Authorization 头，所以允许 ?token= 兜底（和 SSE 一样）。
+/// 网页端用 Authorization 头取回媒体再渲染（blob URL），凭证不再进 URL；
+/// 旧版 &lt;img&gt;/&lt;audio&gt; 直连用的 ?token= 只是有界兼容兜底，命中就打日志提醒迁移。
 /// </summary>
 [RouteModule(40)]
 public static class MediaRoutes
@@ -39,8 +40,11 @@ public static class MediaRoutes
         });
 
         // ---------- 表情包文件 ----------
+        // 与列表/聊天一致要求登录：表情库属于站点的个人资产，不再是无凭证公开资源
         r.Prefix("GET", "api/sticker/", async call =>
         {
+            var me = MeOf(api, call.Http);
+            if (me is null) { await HttpUtil.SendAsync(call.Http, 401, """{"ok":false,"reason":"没登录"}""", "application/json; charset=utf-8"); return; }
             var stickers = api.Get<IStickerService>();
             if (stickers is null) { await HttpUtil.Fail(call.Http, "表情库没装上"); return; }
 
@@ -108,22 +112,18 @@ public static class MediaRoutes
         });
 
         // ---------- 站点图标 / 头像 / 背景 ----------
+        // 图标是站点品牌入口（登录前可用），只给公共 icon.svg，不再回退成主人的私人头像文件
         r.Add("GET", "api/icon", async call =>
         {
-            var avatar = DataFile(api, "avatar");
-            if (File.Exists(avatar))
-            {
-                var mime = ReadMime(api, "avatar.mime", "image/png");
-                await HttpUtil.SendBytesAsync(call.Http, await File.ReadAllBytesAsync(avatar), mime, "no-cache");
-                return;
-            }
             var icon = Path.Combine(api.PublicRoot, "icon.svg");
             if (!File.Exists(icon)) { await HttpUtil.SendAsync(call.Http, 404, "not found"); return; }
             await HttpUtil.SendBytesAsync(call.Http, await File.ReadAllBytesAsync(icon), "image/svg+xml", "no-cache");
         });
 
+        // 头像/背景是主人的个人资源，和聊天媒体一样要登录后才能取（网页端用 Bearer fetch 成 blob 渲染）
         r.Add("GET", "api/avatar", async call =>
         {
+            if (MeOf(api, call.Http) is null) { await HttpUtil.SendAsync(call.Http, 401, """{"ok":false,"reason":"没登录"}""", "application/json; charset=utf-8"); return; }
             var avatar = DataFile(api, "avatar");
             if (!File.Exists(avatar)) { await HttpUtil.Fail(call.Http, "还没有头像"); return; }
             var mime = ReadMime(api, "avatar.mime", "image/png");
@@ -150,6 +150,7 @@ public static class MediaRoutes
 
         r.Add("GET", "api/background", async call =>
         {
+            if (MeOf(api, call.Http) is null) { await HttpUtil.SendAsync(call.Http, 401, """{"ok":false,"reason":"没登录"}""", "application/json; charset=utf-8"); return; }
             var bg = DataFile(api, "background");
             if (!File.Exists(bg)) { await HttpUtil.Fail(call.Http, "还没有背景图"); return; }
             var mime = ReadMime(api, "background.mime", "image/jpeg");
@@ -177,18 +178,12 @@ public static class MediaRoutes
         });
     }
 
-    /// <summary>URL 里的 token 和 header/cookie 里的都试一遍，谁认出来用谁（原版 meOf）。</summary>
+    /// <summary>凭证 header/cookie 优先；旧版 URL ?token= 只是有界兼容兜底，命中打日志（原版 meOf）。</summary>
     private static Core.Auth.SessionUser? MeOf(ApiContext api, HttpContext ctx)
     {
-        var fromUrl = ctx.Request.Query["token"].ToString();
-        var fromReq = HttpUtil.TokenOf(ctx);
-        foreach (var t in new[] { fromUrl, fromReq })
-        {
-            if (string.IsNullOrEmpty(t)) continue;
-            var me = api.Auth.SessionUserOf(t);
-            if (me is not null) return me;
-        }
-        return null;
+        var (token, fromQuery) = HttpUtil.SessionTokenOf(ctx);
+        if (fromQuery) api.Log.Child("web").Warn("媒体请求用了旧版 URL ?token= 兼容，请更新客户端改用 Authorization");
+        return api.Auth.SessionUserOf(token);
     }
 
     private static string DataFile(ApiContext api, string name) => Path.Combine(api.Store.Root, name);

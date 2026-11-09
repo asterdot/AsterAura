@@ -38,6 +38,7 @@ public sealed partial class MemoryService : IMemoryService
     private MemoryIndex? _index;
     private string _indexStamp = "";
     private int _busy;
+    private int _compressBusy;
 
     public MemoryService(FeatureHost host)
     {
@@ -59,9 +60,26 @@ public sealed partial class MemoryService : IMemoryService
             {
                 _state = DataStore.ReadObject(_file, new JsonObject());
                 if (_state["items"] is not JsonArray) _state["items"] = new JsonArray();
+                // 召回日志随 memories.json 持久化：重启后面板还能翻到最近几次召回
+                if (_state["recalls"] is JsonArray log)
+                {
+                    foreach (var n in log)
+                    {
+                        if (_recallLog.Count >= RecallLogMax) break;
+                        if (n is JsonObject entry) _recallLog.Add((JsonObject)entry.DeepClone());
+                    }
+                }
             }
             return _state;
         }
+    }
+
+    /// <summary>把内存里的召回日志同步进 _state（调用方持有 _gate，随后 Save 落盘）。</summary>
+    private void PersistRecallLogLocked()
+    {
+        var arr = new JsonArray();
+        foreach (var entry in _recallLog) arr.Add(entry.DeepClone());
+        _state!["recalls"] = arr;
     }
 
     private void Save()
@@ -314,7 +332,7 @@ public sealed partial class MemoryService : IMemoryService
             }
         }
 
-        _recallLog.Insert(0, new JsonObject
+        var entry = new JsonObject
         {
             ["at"] = now,
             ["where"] = where,
@@ -326,25 +344,30 @@ public sealed partial class MemoryService : IMemoryService
                 ["score"] = Math.Round(h.Score, 2),
                 ["why"] = new JsonArray(h.Why.Select(w => (JsonNode)JsonValue.Create(w)!).ToArray()),
             }).ToArray()),
-        });
-        if (_recallLog.Count > RecallLogMax) _recallLog.RemoveRange(RecallLogMax, _recallLog.Count - RecallLogMax);
+        };
 
-        if (hits.Count == 0) return hits;
-
+        // 召回日志 + 命中计数一起落盘：日志不再只活在内存里，重启后还在
         lock (_gate)
         {
-            var today = ChatLog.DayKey();
-            foreach (var h in hits)
+            _recallLog.Insert(0, entry);
+            if (_recallLog.Count > RecallLogMax) _recallLog.RemoveRange(RecallLogMax, _recallLog.Count - RecallLogMax);
+            PersistRecallLogLocked();
+
+            if (hits.Count > 0)
             {
-                var m = FindItem(MemoryText.Id(h.Item));
-                if (m is null) continue;
-                var lastHit = MemoryText.LastHit(m);
-                var lastDay = lastHit > 0
-                    ? ChatLog.DayKey(DateTimeOffset.FromUnixTimeMilliseconds(lastHit).LocalDateTime)
-                    : "";
-                if (lastDay != today) m["hitDays"] = MemoryText.HitDays(m) + 1;
-                m["hits"] = JsonUtil.Int(m["hits"], 0) + 1;
-                m["lastHit"] = now;
+                var today = ChatLog.DayKey();
+                foreach (var h in hits)
+                {
+                    var m = FindItem(MemoryText.Id(h.Item));
+                    if (m is null) continue;
+                    var lastHit = MemoryText.LastHit(m);
+                    var lastDay = lastHit > 0
+                        ? ChatLog.DayKey(DateTimeOffset.FromUnixTimeMilliseconds(lastHit).LocalDateTime)
+                        : "";
+                    if (lastDay != today) m["hitDays"] = MemoryText.HitDays(m) + 1;
+                    m["hits"] = JsonUtil.Int(m["hits"], 0) + 1;
+                    m["lastHit"] = now;
+                }
             }
             Save();
         }
@@ -549,6 +572,7 @@ public sealed partial class MemoryService : IMemoryService
 
     public JsonArray Recalls()
     {
+        Load(); // 确保从盘上恢复过（重启后第一次调也能读到）
         var output = new JsonArray();
         foreach (var entry in _recallLog.ToList()) output.Add(entry.DeepClone());
         return output;

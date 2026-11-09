@@ -65,10 +65,10 @@ public static class ToolSchemas
 
     public static readonly ToolSchema WebSendMessage = new(
         SendMessage,
-        "主动给某个网页用户发一条消息（不是回复当前聊天时用）。target 写 owner（主人）或 guest-<账号>（某个客人）；只能发给主人和已经存在的客人账号。",
+        "主动给某个网页用户发一条消息（不是回复当前聊天时用）。target 写 owner（主人）；只能发给主人。",
         Parameters(new JsonObject
         {
-            ["target"] = Str("owner 或 guest-<账号>"),
+            ["target"] = Str("owner"),
             ["text"] = Str("要发的话，可以用 ||| 分多条、<voice>…</voice> 发语音、<sticker:名字> 发表情"),
         }, "target", "text"));
 

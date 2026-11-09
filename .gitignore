@@ -8,3 +8,8 @@ _test-data/
 # 本地运行/调试产物（headless 数据目录、日志 dump）
 _run_*/
 *.out
+
+# 工具/构建缓存与备份文件（勿入库）
+NuGet/
+Microsoft/
+*.bak

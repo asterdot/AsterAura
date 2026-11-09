@@ -16,6 +16,11 @@
   <ItemGroup>
     <ProjectReference Include="..\AuraChat.Core\AuraChat.Core.csproj" />
     <ProjectReference Include="..\AuraChat.Features\AuraChat.Features.csproj" />
+    <!-- 路由层的纯函数（DebugRoutes.BuildSystemPartsAsync）要在测试里直调 -->
+    <ProjectReference Include="..\AuraChat.Server\AuraChat.Server.csproj" />
+    <!-- SecurityBoundaryTests 直接使用 Microsoft.AspNetCore.Http 类型；
+         不加此 FrameworkReference 时测试宿主解析不到 ASP.NET Core 共享框架（t4/release-client 2026-11-07） -->
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
   </ItemGroup>
 
 </Project>

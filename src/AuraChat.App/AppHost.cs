@@ -134,7 +134,8 @@ public sealed class AppHost : IAsyncDisposable
     /// <summary>按配置启动 HTTP 服务。返回失败原因（端口占用之类）。</summary>
     public async Task<string?> StartServerAsync()
     {
-        var webHost = JsonUtil.Str(Config.Current["web"]?["host"], "0.0.0.0");
+        // 默认监听 loopback；旧数据里显式存的 0.0.0.0 / 局域网地址原样保留（ServerHost 侧会打可见提醒）
+        var webHost = JsonUtil.Str(Config.Current["web"]?["host"], "127.0.0.1");
         var port = JsonUtil.Int(Config.Current["web"]?["port"], 2332);
         var (ok, reason) = await Server.StartAsync(webHost, port);
         if (!ok) return reason;

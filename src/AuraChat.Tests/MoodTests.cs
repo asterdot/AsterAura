@@ -88,4 +88,43 @@ public class MoodTests : IDisposable
     {
         try { Directory.Delete(_root, recursive: true); } catch { }
     }
+    [Fact]
+    public void Save_WithLifeServiceRegistered_SyncsHormonesToStateJson()
+    {
+        // 双源同步回归：MoodService.Save 写 mood.json 后必须同步回 state.json
+        // 如不同步，Current() 优先读 life → Nudge/Reset 无效
+        var lifeRoot = Path.Combine(Path.GetTempPath(), "aurachat-mood-life-sync-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(lifeRoot);
+        var lifeStore = new DataStore(lifeRoot);
+        var lifeLog = new AppLog();
+        var lifeConfig = new AuraChat.Core.Config.ConfigStore(lifeStore, lifeLog).Load();
+        var lifeHost = new FeatureHost
+        {
+            Store = lifeStore,
+            Config = lifeConfig,
+            Auth = new AuthService(lifeStore, lifeLog),
+            Log = lifeLog,
+            Persona = new AuraChat.Core.Personas.PersonaService(lifeStore, Path.Combine(lifeRoot, "bundled")),
+        };
+        var life = new LifeStateService(lifeHost);
+        lifeHost.Set(life);
+        var mood = new MoodService(lifeHost, new GapPool(lifeStore, () => lifeHost.Cfg, lifeLog.Child("gaps")));
+
+        var baselineD = life.GetCurrentHormones().Dopamine;
+
+        // Nudge +30 → Save → 同步写回 state.json → GetCurrentHormones 反映变化
+        mood.Nudge(30, "同步测试");
+        var afterD = life.GetCurrentHormones().Dopamine;
+
+        Assert.True(afterD > baselineD,
+            $"Nudge 后 state.json 的 dopamine 应已同步上升，baseline={baselineD} after={afterD}");
+
+        // Reset → Save → 同步写回基线
+        mood.Reset();
+        var resetD = life.GetCurrentHormones().Dopamine;
+        Assert.True(resetD < afterD,
+            $"Reset 后 state.json 的 dopamine 应回落，after={afterD} reset={resetD}");
+
+        try { Directory.Delete(lifeRoot, true); } catch { }
+    }
 }

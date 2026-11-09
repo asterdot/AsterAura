@@ -38,19 +38,27 @@ public sealed class LlmClient : ILlmClient
     private readonly AreaLog _log;
     private readonly string? _baseUrlOverride;
     private readonly string? _apiKeyOverride;
+    private readonly IModelProvider _provider;
 
     public LlmClient(FeatureHost host, HttpClient http)
-        : this(host, http, null, null)
+        : this(host, http, null, null, null)
     {
     }
 
     /// <summary>固定接口地址 / 密钥的客户端（guard 用自己那套 baseUrl + apiKey 时构造）。</summary>
     public LlmClient(FeatureHost host, HttpClient http, string? baseUrl, string? apiKey)
+        : this(host, http, baseUrl, apiKey, null)
+    {
+    }
+
+    /// <summary>完整构造：支持 Provider 统一接口。</summary>
+    public LlmClient(FeatureHost host, HttpClient http, string? baseUrl, string? apiKey, IModelProvider? provider)
     {
         _host = host;
         _http = http;
         _baseUrlOverride = string.IsNullOrWhiteSpace(baseUrl) ? null : baseUrl.Trim();
         _apiKeyOverride = string.IsNullOrWhiteSpace(apiKey) ? null : apiKey.Trim();
+        _provider = provider ?? new UserKeyProvider(http); // 默认用户Key模式
         _log = host.Log.Child("ai");
     }
 
@@ -63,8 +71,11 @@ public sealed class LlmClient : ILlmClient
     {
         var ep = Resolve(options);
         var body = BuildBody(options, messages, ep.ModelOr(options.Model), stream: false, logprobs: false);
-        using var resp = await SendAsync(ep, body, options.TimeoutMs, stream: false, ct).ConfigureAwait(false);
-        var json = await ReadJsonAsync(resp, ct).ConfigureAwait(false);
+        
+        // 使用 Provider 调用
+        _log.Debug($"调用模型 {ep.ProviderId}/{ep.Model} (Provider: {_provider.Name})");
+        var json = await _provider.AskAsync(ep, body, options.TimeoutMs, ct).ConfigureAwait(false);
+        
         // 原版 askModel 返回 out.trim()，这里保持一致
         return ExtractContent(json["choices"] is JsonArray { Count: > 0 } choices
                 ? (choices[0] as JsonObject)?["message"] as JsonObject
@@ -83,8 +94,10 @@ public sealed class LlmClient : ILlmClient
     {
         var ep = Resolve(options);
         var body = BuildBody(options, messages, ep.ModelOr(options.Model), stream: false, logprobs: false, tools: tools, toolHistory: toolHistory);
-        using var resp = await SendAsync(ep, body, options.TimeoutMs, stream: false, ct).ConfigureAwait(false);
-        var json = await ReadJsonAsync(resp, ct).ConfigureAwait(false);
+        
+        // 使用 Provider 调用
+        var json = await _provider.AskAsync(ep, body, options.TimeoutMs, ct).ConfigureAwait(false);
+        
         return (json["choices"] is JsonArray { Count: > 0 } choices
                 ? (choices[0] as JsonObject)?["message"] as JsonObject
                 : null) ?? new JsonObject();
@@ -97,37 +110,12 @@ public sealed class LlmClient : ILlmClient
     {
         var ep = Resolve(options);
         var body = BuildBody(options, messages, ep.ModelOr(options.Model), stream: true, logprobs: false);
-        using var resp = await SendAsync(ep, body, options.TimeoutMs, stream: true, ct).ConfigureAwait(false);
-        using var stream = await resp.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
-        using var reader = new StreamReader(stream, Encoding.UTF8);
-
-        while (true)
+        
+        // 使用 Provider 流式调用
+        _log.Debug($"流式调用模型 {ep.ProviderId}/{ep.Model} (Provider: {_provider.Name})");
+        await foreach (var piece in _provider.StreamAsync(ep, body, options.TimeoutMs, ct).ConfigureAwait(false))
         {
-            var line = await reader.ReadLineAsync(ct).ConfigureAwait(false);
-            if (line is null) break;
-
-            line = line.Trim();
-            if (line.Length == 0) continue;
-            if (line[0] == ':') continue;                                   // SSE 注释/心跳
-            if (!line.StartsWith("data:", StringComparison.Ordinal)) continue;
-
-            var data = line[5..].Trim();
-            if (data.Length == 0) continue;
-            if (data is "[DONE]") break;
-
-            JsonNode? node;
-            try { node = JsonNode.Parse(data); }
-            catch (JsonException) { continue; }                             // 半行/坏行直接跳过
-
-            if (node is not JsonObject obj) continue;
-
-            if (obj["error"] is JsonObject err)
-                throw new LlmException("模型调用失败：" + (err["message"]?.ToString() ?? "对方返回了错误"));
-
-            if (obj["choices"] is not JsonArray choices || choices.Count == 0) continue;
-            var delta = (choices[0] as JsonObject)?["delta"] as JsonObject;
-            var piece = delta?["content"]?.ToString();
-            if (!string.IsNullOrEmpty(piece)) yield return piece;
+            yield return piece;
         }
     }
 
@@ -139,8 +127,10 @@ public sealed class LlmClient : ILlmClient
         var ep = Resolve(options);
         var top = Math.Clamp(options.TopLogprobs <= 0 ? 1 : options.TopLogprobs, 1, MaxTopLogprobs);
         var body = BuildBody(options, messages, ep.ModelOr(options.Model), stream: false, logprobs: true, top);
-        using var resp = await SendAsync(ep, body, options.TimeoutMs, stream: false, ct).ConfigureAwait(false);
-        var json = await ReadJsonAsync(resp, ct).ConfigureAwait(false);
+        
+        // 使用 Provider 调用
+        var json = await _provider.AskAsync(ep, body, options.TimeoutMs, ct).ConfigureAwait(false);
+        
         return ParseLogprobs(json);
     }
 
@@ -182,9 +172,7 @@ public sealed class LlmClient : ILlmClient
         {
             if (m is null) continue;
             // content 若是 JSON 数组（多模态 [{type:text},{type:image_url}]），原样透传；否则当纯文本
-            JsonNode? content = (m.Content ?? "").StartsWith('[')
-                ? JsonNode.Parse(m.Content)
-                : m.Content;
+            JsonNode? content = ParseContent(m.Content);
             list.Add(new JsonObject
             {
                 ["role"] = NormalizeRole(m.Role),
@@ -223,6 +211,26 @@ public sealed class LlmClient : ILlmClient
         }
 
         return body;
+    }
+
+    /// <summary>
+    /// 只有真的能解析成 JSON 数组才当多模态内容透传；`[` 开头的普通文本（人类的「引用回复」就会产生
+    /// `[引用 …]\n…`）解析失败时必须回落成纯文本，不能让 JsonException 逃出去把整轮对话打挂。
+    /// </summary>
+    private static JsonNode? ParseContent(string? raw)
+    {
+        var text = raw ?? "";
+        if (!text.StartsWith('[')) return text;
+
+        try
+        {
+            var node = JsonNode.Parse(text);
+            return node ?? text;
+        }
+        catch (JsonException)
+        {
+            return text;
+        }
     }
 
     private static string NormalizeRole(string? role) => (role ?? "").Trim().ToLowerInvariant() switch

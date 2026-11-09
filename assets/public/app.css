@@ -110,8 +110,13 @@ button:disabled { opacity: .55; cursor: default; }
 .gate-logo img, .rail-avatar img { width: 100%; height: 100%; object-fit: cover; border-radius: var(--radius); }
 #gate-title { margin: 0 0 4px; font-size: 20px; font-weight: 600; }
 #gate-sub { margin: 0 0 16px; font-size: 13px; }
-#gate-form input, .wizard input { margin-bottom: 10px; }
-#gate-form button { width: 100%; }
+#gate-form input, #reg-form input, #comp-form input, .wizard input { margin-bottom: 10px; }
+#gate-form button, #reg-form button, #comp-form button { width: 100%; }
+#reg-form p, #comp-form p { margin: 0 0 12px; }
+.gate-links { display: flex; gap: 14px; align-items: center; margin-top: 14px; font-size: 13px; }
+.gate-links a { color: var(--accent); text-decoration: none; cursor: pointer; }
+.gate-links a.muted { color: var(--muted); }
+.gate-links a.hidden { display: none; }
 .gate-msg { min-height: 18px; margin: 6px 0 0; font-size: 13px; color: var(--danger); }
 .wizard { margin-top: 4px; }
 .w-step h2 { margin: 0 0 12px; font-size: 15px; font-weight: 600; }
@@ -153,7 +158,7 @@ button:disabled { opacity: .55; cursor: default; }
 }
 .rail-avatar {
   width: 34px; height: 34px; display: flex; align-items: center; justify-content: center;
-  color: var(--accent); overflow: hidden; border-radius: var(--radius);
+  color: var(--accent); position: relative; border-radius: var(--radius);
 }
 .rail-avatar img { width: 34px; height: 34px; object-fit: cover; }
 .rail-nav { display: flex; flex-direction: column; gap: 4px; width: 100%; }
@@ -286,11 +291,6 @@ body[data-theme="dark"] .msg.me .bubble .meta { color: rgba(255, 255, 255, .55);
 }
 .switch input:checked ~ .slider { transform: translateX(20px); }
 .switch:has(input:checked) { background: var(--ok); }
-.guest-row { display: flex; align-items: center; gap: 8px; padding: 7px 0; border-bottom: 1px solid var(--line2); flex-wrap: wrap; }
-.guest-row:last-child { border-bottom: 0; }
-.guest-row .g-name { font-weight: 600; }
-.guest-row .spacer { flex: 1; }
-.guest-row select { width: auto; }
 .onetime { font-family: ui-monospace, Consolas, monospace; background: var(--panel2); border: 1px solid var(--line); padding: 2px 6px; }
 .tts-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 10px; margin: 4px 0 14px; }
 .tts-card {
@@ -453,13 +453,37 @@ body[data-wall] .msg.me .bubble { background: var(--bubble-me); }
 .heard { margin-top: 6px; font-size: 12px; opacity: .72; }
 .inline-edit { display: flex; gap: 6px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
 .inline-edit input { flex: 1; min-width: 160px; }
-/* ---- D4 引用块 / D5 消息菜单 / D3 已读角标 / C3 上下文调试 ---- */
+/* ---- D4 引用块 / D5 消息菜单 / C3 上下文调试 ---- */
 .quote-block { border-left: 3px solid var(--accent, #3b82f6); background: rgba(120,140,180,.12); padding: 4px 8px; margin-bottom: 6px; border-radius: 6px; font-size: 12px; opacity: .85; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .msg-menu { position: fixed; z-index: 999; background: var(--bg, #fff); border: 1px solid rgba(128,128,128,.35); border-radius: 10px; box-shadow: 0 6px 24px rgba(0,0,0,.18); padding: 4px; display: flex; flex-direction: column; min-width: 120px; }
 .msg-menu button { border: 0; background: none; text-align: left; padding: 8px 12px; border-radius: 8px; font-size: 13px; cursor: pointer; }
 .msg-menu button:hover { background: rgba(128,128,128,.15); }
-.read-mark { display: inline-block; width: 8px; height: 8px; margin-left: 4px; border-radius: 50%; background: rgba(128,128,128,.35); vertical-align: middle; }
-.read-mark.on { background: #34c759; }
+/* ---- #1 已读（A 半）：我读到哪了 —— 未读点 / 3% 底色 / 上次看到这里 / rail 红点 ---- */
+.msg.her.unread { background: color-mix(in srgb, var(--accent) 3%, transparent); border-radius: 10px; }
+.msg.her.unread .bubble { position: relative; background: color-mix(in srgb, var(--accent) 3%, var(--bubble-her)); }
+.msg.her.unread .bubble::before {
+  content: ''; position: absolute; left: -10px; top: 13px;
+  width: 6px; height: 6px; border-radius: 50%; background: var(--accent);
+}
+.unread-line {
+  align-self: stretch; display: flex; align-items: center; gap: 8px;
+  color: var(--muted); font-size: 11.5px; margin: 6px 2px; user-select: none;
+}
+.unread-line::before, .unread-line::after { content: ''; height: 1px; background: var(--line); flex: 1; }
+.rail-avatar[data-unread]::after {
+  content: attr(data-unread);
+  position: absolute; top: -5px; right: -5px;
+  min-width: 16px; height: 16px; padding: 0 4px; box-sizing: border-box;
+  background: #ff3b30; color: #fff; border-radius: 999px;
+  font-size: 10.5px; line-height: 16px; text-align: center; font-weight: 600;
+  box-shadow: 0 0 0 2px var(--bg2);
+}
+/* ---- #1 已读（B 半）：我消息上的三段态 已送出 → 她收到了 → 她正在回复（她回复了即消失） ---- */
+.rstat { margin-left: 4px; }
+.msg.me .bubble .meta .rstat[data-k="got"],
+.msg.me .bubble .meta .rstat[data-k="typing"] { color: var(--accent); }
+.rstat[data-k="typing"]::after { content: '…'; animation: rstat-blink 1.2s steps(1) infinite; }
+@keyframes rstat-blink { 0%, 50% { opacity: 1; } 51%, 100% { opacity: .15; } }
 #reply-bar { display: flex; align-items: center; gap: 8px; margin: 4px 8px; padding: 6px 10px; border-left: 3px solid var(--accent, #3b82f6); background: rgba(120,140,180,.12); border-radius: 8px; font-size: 12px; }
 #reply-bar .rb-text { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; opacity: .85; }
 #reply-bar .rb-cancel { border: 0; background: none; cursor: pointer; font-size: 14px; opacity: .6; }

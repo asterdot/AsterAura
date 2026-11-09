@@ -122,9 +122,114 @@ public sealed class HistoryStore : IHistoryStore
 
     private JsonObject ReadIndexLocked(string chatId)
     {
-        var idx = DataStore.ReadJson(IndexFile(chatId)) as JsonObject;
-        if (idx is not null && idx["segments"] is JsonArray) return EnsureSeqLocked(chatId, idx);
+        var idx = DataStore.ReadJsonDetailed(IndexFile(chatId));
+        if (idx.Status == JsonReadStatus.Ok && idx.Node is JsonObject parsed && parsed["segments"] is JsonArray)
+        {
+            ReconcileLocked(chatId, parsed);
+            return EnsureSeqLocked(chatId, parsed);
+        }
+        if (idx.Status is JsonReadStatus.Corrupted or JsonReadStatus.IoError)
+            _log.Warn("索引 {0}/index.json {1}（{2}），改从分片重建；原文件不动。", chatId, idx.Status, idx.Error);
         return EnsureSeqLocked(chatId, RebuildIndexLocked(chatId));
+    }
+
+    /// <summary>
+    /// 孤儿分片对账：磁盘上有、索引里没有的 *.json 分片（写分片成功后索引更新失败/崩溃留下的），
+    /// 合并回索引并持久化 —— 数据只多不少；索引里指向读不了/不存在的分片的条目保留（缺口显式可见，原文件绝不删）。
+    /// 例外：内容与已索引分片重复的孤儿（空闲裁切删旧片失败 / 裁切中途崩溃的残留）不收编 ——
+    /// 否则同一条消息在翻页里出现两次、健康计数虚高；文件原地保留，在 Health.orphanFiles 里显式可见。
+    /// </summary>
+    private void ReconcileLocked(string chatId, JsonObject idx)
+    {
+        if (idx["segments"] is not JsonArray segs) return;
+        var known = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var node in segs)
+            if (node is JsonObject seg) known.Add(SafeName(Text(seg["id"])));
+
+        string[] files;
+        try
+        {
+            files = Directory.Exists(ChatDir(chatId)) ? Directory.GetFiles(ChatDir(chatId), "*.json") : [];
+        }
+        catch { return; }
+
+        // 先挑候选孤儿；有候选才需要读已索引分片建消息 id 集（常态零开销）
+        var candidates = new List<(string Name, JsonObject Data, JsonArray Messages)>();
+        foreach (var file in files)
+        {
+            var name = Path.GetFileNameWithoutExtension(file);
+            if (string.Equals(name, "index", StringComparison.OrdinalIgnoreCase)) continue;
+            if (string.Equals(name, "read", StringComparison.OrdinalIgnoreCase)) continue;
+            if (known.Contains(name)) continue;
+            var r = DataStore.ReadJsonDetailed(file);
+            if (r.Status != JsonReadStatus.Ok || r.Node is not JsonObject data)
+            {
+                _log.Warn("会话 {0} 有索引外的文件 {1} 但读不出来（{2}），保留原文件、不并入索引。", chatId, name, r.Error ?? r.Status.ToString());
+                continue;
+            }
+            if (data["messages"] is not JsonArray messages || messages.Count == 0) continue;
+            candidates.Add((name, data, messages));
+        }
+        if (candidates.Count == 0) return;
+
+        var seenIds = ReadableMessageIdsLocked(chatId, segs);
+        var added = 0;
+        foreach (var (name, data, messages) in candidates)
+        {
+            if (OverlapsKnownIds(messages, seenIds))
+            {
+                _log.Warn("会话 {0} 索引外文件 {1} 的消息在已索引分片里都有可读副本（裁切残留），不收编以免重复；原文件保留。", chatId, name);
+                continue;
+            }
+            var from = Long(data["from"], Long(messages[0]?["t"]));
+            segs.Add(new JsonObject { ["id"] = Text(data["id"], name), ["from"] = from, ["to"] = Long(data["to"], Long(messages[messages.Count - 1]?["t"])), ["count"] = messages.Count });
+            known.Add(name);
+            CollectMessageIds(messages, seenIds);
+            added++;
+        }
+        if (added > 0)
+        {
+            // 分片按 from 归位，保持翻页顺序稳定
+            var ordered = segs.OrderBy(s => s is JsonObject o ? Long(o["from"]) : 0).ToList();
+            segs.Clear();
+            foreach (var s in ordered) segs.Add(s);
+            WriteIndexLocked(chatId, idx);
+            _log.Warn("会话 {0} 收编 {1} 个孤儿分片（分片写成功但索引没跟上，已合并回索引）。", chatId, added);
+        }
+    }
+
+    /// <summary>已索引分片里实际可读消息的 id 集（读不了的分片拿不到 id，不假装知道——那样残留片收编进来反而是部分恢复）。</summary>
+    private HashSet<string> ReadableMessageIdsLocked(string chatId, JsonArray segs)
+    {
+        var ids = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var node in segs)
+        {
+            if (node is not JsonObject seg || Int(seg["count"]) <= 0) continue;
+            var r = DataStore.ReadJsonDetailed(SegFile(chatId, Text(seg["id"])));
+            if (r.Status == JsonReadStatus.Ok && r.Node is JsonObject data && data["messages"] is JsonArray messages)
+                CollectMessageIds(messages, ids);
+        }
+        return ids;
+    }
+
+    private static void CollectMessageIds(JsonArray messages, HashSet<string> into)
+    {
+        foreach (var m in messages)
+        {
+            var id = Text(m?["id"]);
+            if (id.Length > 0) into.Add(id);
+        }
+    }
+
+    /// <summary>消息里只要有一条 id 已在索引可见副本里，就按重复残留处理（无 id 的消息不参与判重）。</summary>
+    private static bool OverlapsKnownIds(JsonArray messages, HashSet<string> knownIds)
+    {
+        foreach (var m in messages)
+        {
+            var id = Text(m?["id"]);
+            if (id.Length > 0 && knownIds.Contains(id)) return true;
+        }
+        return false;
     }
 
     /// <summary>老分片 id 补上序号（seg-001-…）；目标已存在就跳过。</summary>
@@ -155,7 +260,7 @@ public sealed class HistoryStore : IHistoryStore
         return idx;
     }
 
-    /// <summary>index.json 丢了就扫目录重建（顺手修掉被手动删过片的索引）。</summary>
+    /// <summary>index.json 丢了/坏了就扫目录重建（顺手收编孤儿分片）；损坏的分片跳过但原文件保留，缺口走 Health 显式暴露。</summary>
     private JsonObject RebuildIndexLocked(string chatId)
     {
         var idx = new JsonObject { ["chatId"] = chatId, ["segments"] = new JsonArray(), ["updatedAt"] = 0 };
@@ -171,20 +276,36 @@ public sealed class HistoryStore : IHistoryStore
             return idx;
         }
 
-        var found = new List<(long From, JsonObject Seg)>();
+        var found = new List<(long From, JsonObject Seg, JsonArray Messages)>();
+        var seenIds = new HashSet<string>(StringComparer.Ordinal);
         foreach (var file in files)
         {
-            if (string.Equals(Path.GetFileName(file), "index.json", StringComparison.OrdinalIgnoreCase)) continue;
-            if (DataStore.ReadObject(file, new JsonObject()) is not { } data) continue;
+            var name = Path.GetFileNameWithoutExtension(file);
+            if (string.Equals(name, "index", StringComparison.OrdinalIgnoreCase)) continue;
+            if (string.Equals(name, "read", StringComparison.OrdinalIgnoreCase)) continue;
+            var r = DataStore.ReadJsonDetailed(file);
+            if (r.Status != JsonReadStatus.Ok || r.Node is not JsonObject data)
+            {
+                if (r.Status != JsonReadStatus.Missing)
+                    _log.Warn("会话 {0} 重建索引时跳过读不了的分片 {1}（{2}）；原文件保留，缺口在 Health 里可见。", chatId, name, r.Error ?? r.Status.ToString());
+                continue;
+            }
             if (data["messages"] is not JsonArray messages || messages.Count == 0) continue;
+            // GetFiles 按名字序（片 id 时间戳单调），后出现的重复内容是裁切残留，跳过以免翻页重复
+            if (OverlapsKnownIds(messages, seenIds))
+            {
+                _log.Warn("会话 {0} 重建索引时跳过内容重复的分片 {1}（裁切残留）；原文件保留。", chatId, name);
+                continue;
+            }
+            CollectMessageIds(messages, seenIds);
             var from = Long(data["from"], Long(messages[0]?["t"]));
             var to = Long(data["to"], Long(messages[messages.Count - 1]?["t"]));
-            var id = Text(data["id"], Path.GetFileNameWithoutExtension(file));
-            found.Add((from, new JsonObject { ["id"] = id, ["from"] = from, ["to"] = to, ["count"] = messages.Count }));
+            var id = Text(data["id"], name);
+            found.Add((from, new JsonObject { ["id"] = id, ["from"] = from, ["to"] = to, ["count"] = messages.Count }, messages));
         }
         found.Sort((a, b) => a.From.CompareTo(b.From));
         var segs = new JsonArray();
-        foreach (var (_, seg) in found) segs.Add(seg);
+        foreach (var (_, seg, _) in found) segs.Add(seg);
         idx["segments"] = segs;
         idx["updatedAt"] = Now;
         if (segs.Count > 0) DataStore.WriteJson(IndexFile(chatId), idx);
@@ -200,8 +321,12 @@ public sealed class HistoryStore : IHistoryStore
 
     private JsonObject? ReadSegLocked(string chatId, string id)
     {
-        var data = DataStore.ReadJson(SegFile(chatId, id)) as JsonObject;
-        return data?["messages"] is JsonArray ? data : null;
+        var r = DataStore.ReadJsonDetailed(SegFile(chatId, id));
+        if (r.Status == JsonReadStatus.Ok && r.Node is JsonObject data && data["messages"] is JsonArray) return data;
+        // 读不了的分片：翻页会跳过（缺口），但绝不删原文件；这里把缺口说清楚，Health 也能查到
+        if (r.Status != JsonReadStatus.Missing)
+            _log.Warn("会话 {0} 分片 {1} 读不出来（{2}）：这一段历史暂时不可见，原文件保留。", chatId, id, r.Error ?? r.Status.ToString());
+        return null;
     }
 
     private static string NewSegmentId(int seq)
@@ -238,8 +363,29 @@ public sealed class HistoryStore : IHistoryStore
                 WriteIndexLocked(chatId, idx);
             }
 
-            var data = ReadSegLocked(chatId, Text(seg["id"]))
-                       ?? new JsonObject { ["chatId"] = chatId, ["id"] = Text(seg["id"]), ["from"] = Long(msg["t"]), ["to"] = Long(msg["t"]), ["messages"] = new JsonArray() };
+            var data = ReadSegLocked(chatId, Text(seg["id"]));
+            var segFileExists = File.Exists(SegFile(chatId, Text(seg["id"])));
+            if (data is null && (segFileExists || Int(seg["count"]) > 0))
+            {
+                // 当前片「应该有内容」但读不出来（损坏/占用）：绝不拿默认空对象覆盖原文件 ——
+                // 滚一个新片接着写，旧片的字节原地保留，等手工恢复后 Reconcile 会把它并回索引。
+                _log.Warn("会话 {0} 当前分片 {1} 读不出来，滚动新分片继续写；原分片文件保留。", chatId, Text(seg["id"]));
+                seg = new JsonObject
+                {
+                    ["id"] = NewSegmentId(segs.Count + 1),
+                    ["from"] = Long(msg["t"]),
+                    ["to"] = Long(msg["t"]),
+                    ["count"] = 0,
+                };
+                segs.Add(seg);
+                WriteIndexLocked(chatId, idx);
+                data = new JsonObject { ["chatId"] = chatId, ["id"] = Text(seg["id"]), ["from"] = Long(msg["t"]), ["to"] = Long(msg["t"]), ["messages"] = new JsonArray() };
+            }
+            else if (data is null)
+            {
+                // 全新片（索引刚登记、文件还没落）：正常初始化，不是故障
+                data = new JsonObject { ["chatId"] = chatId, ["id"] = Text(seg["id"]), ["from"] = Long(msg["t"]), ["to"] = Long(msg["t"]), ["messages"] = new JsonArray() };
+            }
             var messages = (JsonArray)data["messages"]!;
             messages.Add(msg);
             data["from"] = Long(messages[0]?["t"]);
@@ -644,6 +790,84 @@ public sealed class HistoryStore : IHistoryStore
         return result;
     }
 
+    /// <summary>
+    /// 单会话存储健康诊断（只读，不触发修复、不删任何文件）：
+    /// indexStatus = 索引文件状态；unreadableSegments = 索引里指向但读不出来/缺失的分片（翻页时的缺口）；
+    /// orphanFiles = 磁盘上有、索引里没有的分片（新数据下次读写会被 Reconcile 收编，重复残留会一直留在这里可见）；
+    /// messages = 索引声称的条数，readableMessages = 盘上实际可读条数，两者之差就是坏片/缺片缺口。
+    /// </summary>
+    public JsonObject Health(string chatId)
+    {
+        _io.Wait();
+        try
+        {
+            return HealthLocked(chatId);
+        }
+        finally
+        {
+            _io.Release();
+        }
+    }
+
+    private JsonObject HealthLocked(string chatId)
+    {
+        var idx = DataStore.ReadJsonDetailed(IndexFile(chatId));
+        var result = new JsonObject
+        {
+            ["chatId"] = chatId,
+            ["indexStatus"] = idx.Status.ToString(),
+            ["unreadableSegments"] = new JsonArray(),
+            ["orphanFiles"] = new JsonArray(),
+            ["segments"] = 0,
+            ["messages"] = 0,
+            ["readableMessages"] = 0,   // 盘上实际可读的条数：与 messages 的差 = 坏片/缺片造成的缺口
+        };
+        var known = new HashSet<string>(StringComparer.Ordinal);
+        if (idx.Node is JsonObject indexObj && indexObj["segments"] is JsonArray segs)
+        {
+            foreach (var node in segs)
+            {
+                if (node is not JsonObject seg) continue;
+                var id = Text(seg["id"]);
+                known.Add(SafeName(id));
+                result["segments"] = result["segments"]!.GetValue<int>() + 1;
+                var count = Int(seg["count"]);
+                result["messages"] = result["messages"]!.GetValue<int>() + count;
+                if (count <= 0) continue;   // 空片没有可缺的内容，不算缺口
+                var file = SegFile(chatId, id);
+                if (!File.Exists(file))
+                {
+                    ((JsonArray)result["unreadableSegments"]!).Add(new JsonObject { ["id"] = id, ["reason"] = "missing" });
+                    continue;
+                }
+                var r = DataStore.ReadJsonDetailed(file);
+                if (r.Status != JsonReadStatus.Ok || (r.Node as JsonObject)?["messages"] is not JsonArray messages)
+                {
+                    ((JsonArray)result["unreadableSegments"]!).Add(new JsonObject { ["id"] = id, ["reason"] = r.Status.ToString(), ["error"] = r.Error });
+                    continue;
+                }
+                // 健康计数以盘上实际条数为准：索引 count 与文件漂移（写片成功索引没跟上）在这里现形
+                result["readableMessages"] = result["readableMessages"]!.GetValue<int>() + messages.Count;
+            }
+        }
+
+        try
+        {
+            if (Directory.Exists(ChatDir(chatId)))
+            {
+                foreach (var file in Directory.GetFiles(ChatDir(chatId), "*.json"))
+                {
+                    var name = Path.GetFileNameWithoutExtension(file);
+                    if (string.Equals(name, "index", StringComparison.OrdinalIgnoreCase)) continue;
+                    if (string.Equals(name, "read", StringComparison.OrdinalIgnoreCase)) continue;
+                    if (!known.Contains(name)) ((JsonArray)result["orphanFiles"]!).Add(name);
+                }
+            }
+        }
+        catch { /* 目录读不了就少报一项 */ }
+        return result;
+    }
+
     // ---------- 空闲裁切 ----------
 
     public void Touch(string chatId)
@@ -927,25 +1151,32 @@ public sealed class HistoryStore : IHistoryStore
             return SweepAll();
         }, ct);
 
-    /// <summary>标成已读，返回之前有多少条未读（机器人发的）。</summary>
-    public Task<int> MarkReadAsync(string chatId, CancellationToken ct = default)
+    /// <summary>
+    /// 标成已读，返回（推进前的未读数, 推进后的水位）。
+    /// v3：客户端可以报自己「看到了 upToT 之前的」，水位只前推不回退，且不许超过服务器现在。
+    /// </summary>
+    public Task<(int UnreadBefore, long ReadAt)> MarkReadAsync(string chatId, long? upToT = null, CancellationToken ct = default)
         => Task.Run(() =>
         {
             var unread = Unread(chatId);
+            var now = Now;
+            var target = upToT is { } t && t > 0 ? Math.Min(t, now) : now;
+            long readAt;
             _io.Wait();
             try
             {
                 var file = ReadFile(chatId);
                 var state = DataStore.ReadObject(file);
-                state["lastReadAt"] = Now;
-                state["updatedAt"] = Now;
+                readAt = Math.Max(Long(state["lastReadAt"]), target);
+                state["lastReadAt"] = readAt;
+                state["updatedAt"] = now;
                 DataStore.WriteJson(file, state);
             }
             finally
             {
                 _io.Release();
             }
-            return unread;
+            return (unread, readAt);
         }, ct);
 
     /// <summary>对方最后的已读时间（毫秒；没读过 0）。D3 已读回执用。</summary>

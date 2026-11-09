@@ -17,25 +17,48 @@ public static class AiModule
     public static (ILlmClient Llm, IModelCatalog Catalog) Create(FeatureHost host)
     {
         var http = SharedHttpClient();
-        var llm = new LlmClient(host, http);
+        
+        // 根据配置选择 Provider
+        var providerMode = host.Str("provider", "mode");
+        var quotaServiceUrl = host.Str("provider", "quotaServiceUrl");
+        
+        IModelProvider provider = providerMode.ToLowerInvariant() switch
+        {
+            "local" => new LocalModelProvider(http),
+            "auraquota" or "quota" when !string.IsNullOrWhiteSpace(quotaServiceUrl) 
+                => new AuraQuotaProvider(http, quotaServiceUrl, () => GetAccessToken(host)),
+            _ => new UserKeyProvider(http) // 默认用户Key模式
+        };
+        
+        var llm = new LlmClient(host, http, null, null, provider);
         var catalog = new ModelCatalog(host, http);
 
         host.Set<ILlmClient>(llm);
         host.Set<IModelCatalog>(catalog);
+        host.Set<IModelProvider>(provider); // 注册 Provider 实例
 
-        var provider = host.Str("model", "provider");
+        var providerName = host.Str("model", "provider");
         var model = host.Str("model", "model");
         var baseUrl = host.Str("model", "baseUrl");
         var hasKey = !string.IsNullOrWhiteSpace(host.Str("model", "apiKey"));
 
         host.Log.Child("ai").Info(
             "模型层已装配：" +
-            $"provider={(provider.Length == 0 ? "（未选）" : provider)}，" +
+            $"provider={(providerName.Length == 0 ? "（未选）" : providerName)}，" +
             $"model={(model.Length == 0 ? "默认" : model)}，" +
             $"接口={(baseUrl.Length == 0 ? "预设" : baseUrl)}，" +
-            $"密钥={(hasKey ? "已配置" : "没填")}");
+            $"密钥={(hasKey ? "已配置" : "没填")}，" +
+            $"模式={provider.Name}");
 
         return (llm, catalog);
+    }
+    
+    /// <summary>获取当前用户访问令牌（用于 AuraQuota 模式）。</summary>
+    private static string? GetAccessToken(FeatureHost host)
+    {
+        // TODO: 从当前会话或认证服务获取访问令牌
+        // 当前版本返回配置中的静态令牌作为占位
+        return host.Str("provider", "accessToken");
     }
 
     /// <summary>

@@ -65,7 +65,7 @@ public static class ChatRoutes
             var voice = b["voice"] as JsonObject;
             var sticker = b["sticker"]?.ToString() ?? "";
             var replyTo = b["replyTo"] as JsonObject;   // D4 引用：{id, text}（id 是被引用消息 id）
-            var name = api.Auth.DisplayNameOf(me.Subject);
+            var name = api.DisplayNameOf(me);
 
             if (text.Trim().Length == 0 && images.Count == 0 && voice is null && sticker.Length == 0)
             {
@@ -171,6 +171,10 @@ public static class ChatRoutes
 
             history.Touch(chatId);
 
+            // v3：落盘 + Touch 都完了才喊「收到了」—— 这条排在本 POST 的 message 回显之后、派发 ChatHub 之前。
+            if (api.Flag(true, "enabled"))
+                api.Emit("received", new JsonObject { ["chatId"] = chatId, ["receivedAt"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() });
+
             var message = new UserMessage(chatId, me.Subject, name, text, images, voice is null ? null : new VoiceInput(voice["data"]?.ToString() ?? "", voice["mime"]?.ToString() ?? "audio/webm", AuraChat.Core.JsonUtil.Num(voice["dur"], 0)), sticker);
             if (hub is not null)
             {
@@ -218,9 +222,13 @@ public static class ChatRoutes
             api.Emit("message", new JsonObject { ["chatId"] = chatId, ["message"] = savedVoice.DeepClone() });
             history.Touch(chatId);
 
+            // v3：同 api/messages —— 落盘 + Touch 之后、派发 ChatHub 之前喊一次「收到了」。
+            if (api.Flag(true, "enabled"))
+                api.Emit("received", new JsonObject { ["chatId"] = chatId, ["receivedAt"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() });
+
             if (hub is not null)
             {
-                var message = new UserMessage(chatId, me.Subject, api.Auth.DisplayNameOf(me.Subject), "", new JsonArray(), new VoiceInput(data, mime, dur), "");
+                var message = new UserMessage(chatId, me.Subject, api.DisplayNameOf(me), "", new JsonArray(), new VoiceInput(data, mime, dur), "");
                 _ = Task.Run(async () =>
                 {
                     try { await hub.OnUserMessageAsync(message); }
@@ -241,7 +249,7 @@ public static class ChatRoutes
             await HttpUtil.JsonAsync(call.Http, new JsonObject { ["ok"] = true });
         });
 
-        // ---------- 已读回执（D3）----------
+        // ---------- 已读回执（D3 / v3）----------
         r.Add("POST", "api/read", async call =>
         {
             var me = await api.RequireUserAsync(call);
@@ -250,18 +258,28 @@ public static class ChatRoutes
             if (history is null) { await HttpUtil.Fail(call.Http, "聊天记录没装上"); return; }
 
             var chatId = ApiContext.ChatIdOf(me.Subject);
-            var unread = await history.MarkReadAsync(chatId);
-            // 广播给对端：她/主人能看到"对方看到了"
+            // v3：可选 {upToT} —— 客户端报「我看到了这个时间点之前的」，缺省＝现在；
+            // 服务端只前推不回退，且夹在服务器现在之内（客户端时钟可能歪）。
+            var b = await HttpUtil.ReadBodyAsync(call.Http);
+            long? upToT = long.TryParse(b["upToT"]?.ToString(), out var t) && t > 0 ? t : null;
+            var (unreadBefore, readAt) = await history.MarkReadAsync(chatId, upToT);
+
+            // 广播给对端：她/主人能看到"对方看到了"，水位＝真正推进后的值
             api.Emit("read", new JsonObject
             {
                 ["chatId"] = chatId,
                 ["subject"] = me.Subject,
-                ["readAt"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                ["readAt"] = readAt,
             });
-            await HttpUtil.JsonAsync(call.Http, new JsonObject { ["ok"] = true, ["unreadBefore"] = unread });
+            await HttpUtil.JsonAsync(call.Http, new JsonObject
+            {
+                ["ok"] = true,
+                ["myReadAt"] = readAt,
+                ["unreadBefore"] = unreadBefore,
+            });
         });
 
-        // 对端的已读时间（渲染"已读/未读"角标用）
+        // 自己的已读水位（渲染"已读/未读"角标用）。v3：只返 myReadAt，不再给对端的（那是不对称信息，前端也不该推断）
         r.Add("GET", "api/read", async call =>
         {
             var me = await api.RequireUserAsync(call);
@@ -271,8 +289,7 @@ public static class ChatRoutes
             await HttpUtil.JsonAsync(call.Http, new JsonObject
             {
                 ["ok"] = true,
-                ["myReadAt"] = await Task.FromResult(history.LastReadAt(ApiContext.ChatIdOf(me.Subject))),
-                ["peerReadAt"] = history.LastReadAt(ApiContext.ChatIdOf(AuraChat.Core.AuraChatInfo.OwnerId)),
+                ["myReadAt"] = history.LastReadAt(ApiContext.ChatIdOf(me.Subject)),
             });
         });
     }

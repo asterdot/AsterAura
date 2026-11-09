@@ -9,7 +9,9 @@ import { createLogsView } from './js/views/logs.js'
 
 const BASE = (location.pathname.replace(/\/?$/, '').replace(/\/index\.html$/, ''))
 const TOKEN_KEY = 'aurachat_token'
-let token = localStorage.getItem(TOKEN_KEY) || ''
+const REMEMBER_KEY = 'aurachat_remember'
+// 记住我：勾选 → token 存 localStorage（关掉浏览器也在）；不勾 → 只存 sessionStorage（关掉浏览器就掉）
+let token = localStorage.getItem(TOKEN_KEY) || sessionStorage.getItem(TOKEN_KEY) || ''
 let botState = null      // /api/state 的结果
 let me = null            // 当前登录的人
 let cfg = null           // 完整配置（主人）
@@ -32,12 +34,24 @@ function api(path, opts = {}) {
   }
   return fetch(BASE + path, { ...opts, headers }).then(async (r) => {
     if (r.status === 401) { setToken(''); }
+    // 会话失效（401）一律回登录页，不留半认证状态、也不留空白主界面
+    if (r.status === 401 && me) { me = null; showGate('login', '登录状态已失效，请重新登录') }
     const t = await r.text()
     try { return JSON.parse(t) } catch (e) { return { ok: false, reason: t.slice(0, 200) || ('HTTP ' + r.status) } }
   }).catch((e) => ({ ok: false, reason: e.message }))
 }
 
-function setToken(t) { token = t || ''; if (t) localStorage.setItem(TOKEN_KEY, t); else localStorage.removeItem(TOKEN_KEY) }
+function setToken(t, remember) {
+  token = t || ''
+  const keep = remember === undefined ? (localStorage.getItem(REMEMBER_KEY) === '1') : !!remember
+  if (remember !== undefined) localStorage.setItem(REMEMBER_KEY, keep ? '1' : '0')
+  localStorage.removeItem(TOKEN_KEY)
+  sessionStorage.removeItem(TOKEN_KEY)
+  if (t) {
+    if (keep) localStorage.setItem(TOKEN_KEY, t)
+    else sessionStorage.setItem(TOKEN_KEY, t)
+  }
+}
 
 function toast(msg, kind = '') {
   const box = $('#toasts')
@@ -51,9 +65,10 @@ function toast(msg, kind = '') {
 const bot = () => (botState && botState.botName) || cfg?.botName || '大肥鱼'
 const botTag = () => (botState && botState.botTag) || cfg?.botTag || ''
 const ownerName = () => (botState && botState.ownerName) || cfg?.ownerName || '主人'
-const isOwner = () => Boolean(me && me.role === 'owner')
+// owner 判定统一：新版本没有访客，凡账号密码登录者皆为主人
+const isOwner = () => Boolean(me && (me.role === 'owner' || me.role === 'account'))
 
-bindTheme({ base: BASE, cfg: () => cfg, state: () => botState })
+bindTheme({ base: BASE, cfg: () => cfg, state: () => botState, fetchLocalBg: () => fetchLocalBg() })
 watchSystemDark()
 
 // 自动化测试用的把手
@@ -61,34 +76,80 @@ window.__aura = {
   get cfg() { return cfg },
   get me() { return me },
   get state() { return botState },
+  get myReadAt() { return myReadAt },
+  get seenAt() { return seenAt },
+  get unreadCount() { return document.querySelectorAll('#msgs .msg.her.unread').length },
   applyTheme,
   playSound,
   bustBackground,
+  reconcileUnread,
 }
 
-function setAvatar(el, hasImg) {
+// 头像也走授权取回（服务端 /api/avatar 已要求登录）：blob object URL，取不到就显示公共 icon.svg
+let avatarBlob = null
+const iconSrc = () => BASE + '/icon.svg'
+function setAvatar(el, src) {
   if (!el) return
-  el.innerHTML = '<img src="' + (hasImg ? BASE + '/api/avatar?ts=' + Date.now() : BASE + '/icon.svg') + '" alt="" />'
+  el.innerHTML = '<img src="' + src + '" alt="" />'
 }
-function refreshAvatar() {
+function disposeAvatarBlob() {
+  if (avatarBlob) { try { URL.revokeObjectURL(avatarBlob) } catch (e) { /* 已回收就算了 */ } avatarBlob = null }
+}
+async function refreshAvatar() {
   const el = $('#rail-avatar')
   if (!el) return
-  const img = new Image()
-  img.onload = () => setAvatar(el, true)
-  img.onerror = () => setAvatar(el, false)
-  img.src = BASE + '/api/avatar?ts=' + Date.now()
+  if (!avatarBlob) setAvatar(el, iconSrc())          // 先给占位，别闪破图
+  try {
+    const r = await fetch(BASE + '/api/avatar?ts=' + Date.now(), {
+      headers: token ? { authorization: 'Bearer ' + token } : {},
+      cache: 'no-store',
+    })
+    if (!r.ok) throw new Error('HTTP ' + r.status)
+    if (!(r.headers.get('content-type') || '').startsWith('image/')) throw new Error('not an image')
+    const u = URL.createObjectURL(await r.blob())
+    disposeAvatarBlob()
+    avatarBlob = u
+    if (el.isConnected) setAvatar(el, u)
+  } catch (e) { /* 没设过头像（401/404）：保持默认图标 */ }
 }
 
 function showGate(mode, msg = '') {
   $('#gate').classList.remove('hidden')
   $('#app').classList.add('hidden')
-  const wiz = $('#wizard'), form = $('#gate-form')
+  const wiz = $('#wizard'), form = $('#gate-form'), reg = $('#reg-form'), comp = $('#comp-form'), links = $('#gate-links')
+  const loginish = mode === 'login' || mode === 'legacy'
   wiz.classList.toggle('hidden', mode !== 'setup')
-  form.classList.toggle('hidden', mode !== 'login')
-  $('#gate-sub').textContent = mode === 'setup' ? '第一次来，先把 Ta 安顿好。' : ''
-  $('#gate-hello').textContent = mode === 'login' ? greet() : ''
-  if (msg) { (mode === 'setup' ? $('#wizard-msg') : $('#gate-msg')).textContent = msg }
-  setAvatar($('#gate-logo'), false)
+  form.classList.toggle('hidden', !loginish)
+  reg.classList.toggle('hidden', mode !== 'register')
+  comp.classList.toggle('hidden', mode !== 'companion')
+  if (links) {
+    links.classList.toggle('hidden', mode === 'setup' || mode === 'companion')
+    const tog = $('#link-toggle')
+    if (tog) {
+      tog.dataset.to = mode === 'register' ? 'login' : 'register'
+      tog.textContent = mode === 'register' ? '已有账号？去登录' : '没有账号？注册一个'
+    }
+    const leg = $('#link-legacy')
+    if (leg) {
+      leg.classList.toggle('hidden', mode === 'register')
+      leg.textContent = mode === 'legacy' ? '用新账号登录' : '本机旧账号登录'
+    }
+    const wlink = $('#link-wizard')
+    // 旧版本机初始化只在登录页显式露出，不是公开注册；
+    // t28：匿名 state 不再携带 needSetup，显式链接不再依赖该字段（服务端 /api/setup 仍会拒绝已有主人的重复初始化）
+    if (wlink) wlink.classList.toggle('hidden', mode !== 'login')
+  }
+  $('#gate-sub').textContent =
+    mode === 'setup' ? '第一次来，先把 Ta 安顿好。' :
+    mode === 'register' ? '注册一个本地账号。' :
+    mode === 'companion' ? '给账号建一个陪伴角色。' :
+    mode === 'legacy' ? '旧账号兼容入口：登录本机原有账号。' : ''
+  $('#gate-hello').textContent = loginish ? greet() : ''
+  if (msg) {
+    const m = mode === 'setup' ? $('#wizard-msg') : mode === 'register' ? $('#reg-msg') : mode === 'companion' ? $('#comp-msg') : $('#gate-msg')
+    if (m) m.textContent = msg
+  }
+  setAvatar($('#gate-logo'), iconSrc())
   applyTitle()
 }
 
@@ -109,7 +170,7 @@ function initWizard() {
     const sel = $('#w-model')
     sel.innerHTML = '<option value="__default__">默认（跟随 DSH）</option>' + models.map((m) => '<option value="' + esc(m.provider + '::' + m.model) + '">' + esc(m.provider + ' / ' + m.model) + '</option>').join('')
   })
-  setAvatar($('#w-avatar-preview'), false)
+  setAvatar($('#w-avatar-preview'), iconSrc())
 
   const form = $('#wizard')
   form.addEventListener('click', (e) => {
@@ -129,7 +190,7 @@ function initWizard() {
     }
     rd.readAsDataURL(f)
   }
-  $('#w-avatar-clear').onclick = () => { wizAvatar = null; setAvatar($('#w-avatar-preview'), false) }
+  $('#w-avatar-clear').onclick = () => { wizAvatar = null; setAvatar($('#w-avatar-preview'), iconSrc()) }
   form.onsubmit = async (e) => {
     e.preventDefault()
     const username = $('#w-username').value.trim()
@@ -162,7 +223,8 @@ function initWizard() {
     }
     const r = await api('/api/setup', { method: 'POST', body })
     if (!r.ok) { $('#wizard-msg').textContent = r.reason || '没建成，再试一次'; return }
-    await doLogin(username, password)
+    // 旧版本机初始化完成后只校验旧凭据（t25：旧会话清凭据回登录，不进主界面），引导用户注册/登录账号
+    await doLogin(username, password, 'legacy')
   }
 }
 
@@ -192,18 +254,70 @@ function showWizStep(n) {
   $$('#wizard .w-step').forEach((s) => s.classList.toggle('hidden', Number(s.dataset.step) !== wizStep))
 }
 
-async function doLogin(username, password) {
-  const r = await api('/api/login', { method: 'POST', body: { username, password } })
+async function doLogin(username, password, mode = 'account') {
+  const path = mode === 'legacy' ? '/api/login' : '/api/v2/auth/login'
+  const r = await api(path, { method: 'POST', body: { username, password } })
   if (!r.ok) {
     const msg = r.reason || '登录失败'
     if ($('#wizard') && !$('#wizard').classList.contains('hidden')) $('#wizard-msg').textContent = msg
     else $('#gate-msg').textContent = msg
     return false
   }
-  setToken(r.token)
-  me = r.me || null
-  await boot()
+  const remember = !($('#g-remember') && $('#g-remember').checked === false)
+  setToken(r.token, remember)
+  if (mode === 'legacy') {
+    // 旧账号兼容登录：只作迁移期校验，不再进入主界面——立即清凭据回登录，
+    // 要求账号认证 + 角色分流（t25：所有登录模式都必须走 account 认证；旧会话清凭据回登录）
+    setToken('')
+    me = null
+    showGate('login', '旧版账号仅用于迁移，请使用账号登录或注册')
+    return false
+  }
+  me = r.account ? { subject: r.account.accountId, role: r.account.role || 'account', name: r.account.displayName || r.account.username, level: 'full' } : null
+  await routeAfterAccountAuth()
   return true
+}
+
+// 账号认证成功后的角色分流（t13：无角色 → 创建页；有角色 → 主界面；失效 → 回登录）
+async function routeAfterAccountAuth() {
+  const s = await api('/api/v2/companions/current')
+  if (s.ok && s.companion) { await enterApp(); return }
+  if (s.ok && !s.companion) {
+    $('#comp-hello').textContent = (me && me.name ? me.name : '这个账号') + '，还没有陪伴角色。'
+    showGate('companion')
+    return
+  }
+  // 任何无法验证角色状态的失败（401/403/503/网络）都清凭据回登录，不留半认证状态（t28）
+  setToken('')
+  me = null
+  showGate('login', s.reason || '登录状态已失效，请重新登录')
+}
+
+function bindRegister() {
+  const form = $('#reg-form')
+  if (!form) return
+  form.onsubmit = async (e) => {
+    e.preventDefault()
+    const r = await api('/api/v2/auth/register', { method: 'POST', body: { username: $('#r-username').value.trim(), password: $('#r-password').value } })
+    if (!r.ok) { $('#reg-msg').textContent = r.reason || '没注册上，再试一次'; return }
+    setToken(r.token, localStorage.getItem(REMEMBER_KEY) === '1')
+    me = { subject: r.account.accountId, role: r.account.role || 'account', name: r.account.displayName || r.account.username, level: 'full' }
+    await routeAfterAccountAuth()   // 注册成功 → 按同一流程取角色状态
+  }
+}
+
+function bindCompanionCreate() {
+  const form = $('#comp-form')
+  if (!form) return
+  form.onsubmit = async (e) => {
+    e.preventDefault()
+    // Idempotency-Key：网络重试/重复提交不会建出第二个角色
+    const key = (typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : 'comp-' + Date.now() + '-' + Math.random().toString(36).slice(2)
+    const r = await api('/api/v2/companions', { method: 'POST', headers: { 'Idempotency-Key': key }, body: { name: $('#c-name').value.trim() } })
+    if (r.ok && r.companion) { toast('角色创建好了'); await enterApp(); return }
+    if (r.companion) { await enterApp(); return }   // 幂等重放：返回同一角色
+    $('#comp-msg').textContent = r.reason || '没建成，再试一次'
+  }
 }
 
 async function enterApp() {
@@ -223,7 +337,7 @@ async function enterApp() {
 const NAVS = [
   { id: 'chat', label: '聊天' },
   { id: 'diary', label: '空间' },
-  { id: 'mood', label: '心情' },
+  { id: 'mood', label: '心情与生命' },
   { id: 'overview', label: '概览', owner: true },
   { id: 'memory', label: '记忆', owner: true },
   { id: 'settings', label: '设置' },
@@ -249,44 +363,234 @@ const views = {
 }
 
 function switchView(id) {
+  if (id !== 'chat' && currentView === 'chat') {
+    // 离开聊天页：DOM 马上清空，把还挂着未读点的她消息折进红点计数；
+    // 已读到没来得及上报的水位在这儿收尾（规则内：读到时条件都满足过）
+    offviewUnread = document.querySelectorAll('#msgs .msg.her.unread').length
+    flushReadPush()
+  }
   currentView = id
   syncNav()
   const main = $('#main')
   main.innerHTML = ''
-  if (id === 'chat') { renderChat(main); markReadSoon() }
+  if (id === 'chat') renderChat(main)
   else if (id === 'diary') renderDiary(main)
-  else if (id === 'mood') views.mood.renderMood(main)
+  else if (id === 'mood') renderMoodAndLife(main)
   else if (id === 'overview') views.overview.renderOverview(main)
   else if (id === 'memory') renderMemory(main)
   else if (id === 'settings') renderSettings(main)
   else if (id === 'logs') views.logs.renderLogs(main)
 }
 
-// D3 已读回执：进入聊天页就把"我读到了"发出去；收到对端 read 事件时刷新角标
+// ---------- #1 已读（A 半）：「我读到哪了」 ----------
+// 只渲染服务器确认的事实：未读 = 她消息的 t > 打开聊天页那一刻的水位快照（seenAt），
+// 不因为水位推进而中途消失。水位推进规则写死（别放宽）：只有「页面可见 + 窗口有焦点 +
+// 当前是聊天视图 + 消息渲染进视口」才消点并推进；切视图 / 最小化 / 切到别的程序一律不推进
+// ——否则又变回「重开一次聊天页就全变已读」那个自欺。
+let myReadAt = 0        // 我的已读水位（服务端 GET api/read 的 myReadAt）
+let seenAt = 0          // 打开聊天页那一刻的水位快照：t > seenAt 的她的消息算「没看过」
+let offviewUnread = 0   // 不在聊天视图时进来的她的消息数（只用于红点；进聊天页后按服务端水位重算）
+let readUiReady = false // 本页水位快照是否已就位（没就位时不判未读，避免拿陈旧 seenAt 乱标）
+let lastReadHerT = 0    // 本会话已读到的最新一条她的 t（POST api/read 的 upToT，契约 §4）
 let readTimer = null
-function markReadSoon() {
-  if (readTimer) clearTimeout(readTimer)
-  readTimer = setTimeout(async () => {
-    try { await api('/api/read', { method: 'POST' }) } catch { /* 不影响聊天 */ }
-    refreshReadMarks()
-  }, 400)
+let msgIo = null        // IntersectionObserver：未读点滚进视口才读掉
+let lineIo = null       // IntersectionObserver：分隔线「滚过即消失」
+
+function canAdvanceRead() {
+  return document.visibilityState === 'visible' && document.hasFocus() && currentView === 'chat'
 }
-async function refreshReadMarks() {
+
+async function fetchReadState() {
   try {
     const r = await api('/api/read')
-    if (!r.ok) return
-    const peer = Number(r.peerReadAt || 0)
-    const box = $('#msgs')
-    if (!box) return
-    // 对方已读时间之后我发的消息标"已读"
-    box.querySelectorAll('.msg.me').forEach((el) => {
-      const mark = el.querySelector('.read-mark')
-      if (!mark) return
-      const mine = Number(el.dataset.t || 0) <= peer
-      mark.classList.toggle('on', mine)
-      mark.title = mine ? '已读' : '未读'
-    })
+    if (r && r.ok) myReadAt = Number(r.myReadAt || 0)
   } catch { /* 静默 */ }
+  return myReadAt
+}
+
+function setRailBadge(n) {
+  const el = $('#rail-avatar')
+  if (!el) return
+  if (n > 0) el.dataset.unread = n > 9 ? '9+' : String(n)
+  else delete el.dataset.unread
+}
+
+function refreshUnreadBadge() {
+  const box = $('#msgs')
+  const n = (box ? box.querySelectorAll('.msg.her.unread').length : 0) + offviewUnread
+  setRailBadge(n)
+}
+
+function hasUnread() {
+  const box = $('#msgs')
+  return Boolean(box && box.querySelector('.msg.her.unread'))
+}
+
+// 推进水位：先把本地水位抬到看见的最大 t，再延迟上报。
+// 本地还有未读没看全就不 POST——服务端 POST api/read 是「标到此刻」，提前打会把还没
+// 进视口的旧未读一并标成已读（契约 ④ 的 upToT 到位前先这样兜住）。
+function advanceReadTo(t) {
+  if (!canAdvanceRead()) return
+  if (t) {
+    myReadAt = Math.max(myReadAt, Number(t) || 0)
+    lastReadHerT = Math.max(lastReadHerT, Number(t) || 0)   // upToT = 已读到的最新一条她的 t（契约 §4）
+  }
+  refreshUnreadBadge()
+  if (readTimer) clearTimeout(readTimer)
+  readTimer = setTimeout(async () => {
+    readTimer = null
+    if (!canAdvanceRead() || hasUnread() || offviewUnread > 0) return
+    try { await api('/api/read', { method: 'POST', body: lastReadHerT > 0 ? { upToT: lastReadHerT } : {} }) } catch { /* 不影响聊天 */ }
+  }, 400)
+}
+
+// 消掉一批未读（调用方先判定这批确实该读：IO 相交，或 reconcile 的视口判定）
+function markReadEls(els) {
+  if (!canAdvanceRead()) return
+  let maxT = 0, hit = false
+  for (const el of els) {
+    if (!el.classList.contains('unread')) continue
+    el.classList.remove('unread')
+    if (msgIo) msgIo.unobserve(el)
+    maxT = Math.max(maxT, Number(el.dataset.t) || 0)
+    hit = true
+  }
+  if (hit) advanceReadTo(maxT)
+}
+
+function watchUnread() {
+  if (msgIo) msgIo.disconnect()
+  msgIo = new IntersectionObserver((entries) => {
+    if (!canAdvanceRead()) return   // 不可见 / 没焦点 / 不在聊天视图：不消点、不推进
+    markReadEls(entries.filter((e) => e.isIntersecting).map((e) => e.target))
+  })
+  const box = $('#msgs')
+  if (box) box.querySelectorAll('.msg.her.unread').forEach((el) => msgIo.observe(el))
+}
+
+// 事件驱动的补账（IO 只在相交变化时回调，页面重新可见/聚焦时相交没变、不会重发）：
+// 载入完成、页面重新可见、窗口重新聚焦时跑一遍——条件不满足时整个函数直接返回。
+function reconcileUnread() {
+  if (!canAdvanceRead()) return
+  const box = $('#msgs'); if (!box) return
+  const vh = window.innerHeight
+  markReadEls(Array.from(box.querySelectorAll('.msg.her.unread')).filter((el) => {
+    const r = el.getBoundingClientRect()
+    return r.bottom > 0 && r.top < vh
+  }))
+}
+
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') reconcileUnread() })
+window.addEventListener('focus', reconcileUnread)
+
+// 离开聊天页前，把已读到却还没上报的水位补上——读到时条件都满足过，上报只是收尾；
+// 未读没看全就照规则不打。
+function flushReadPush() {
+  const pending = readTimer != null
+  if (readTimer) { clearTimeout(readTimer); readTimer = null }
+  if (!pending || !canAdvanceRead() || hasUnread() || offviewUnread > 0) return
+  api('/api/read', { method: 'POST', body: lastReadHerT > 0 ? { upToT: lastReadHerT } : {} }).catch(() => {})
+}
+
+// 「上次看到这里」分隔线：只在打开聊天页时插一次，跟着第一条未读；
+// 见过之后从上方滚出视口（真滚过了）才撤，往回翻旧记录从下方滚出不撤。
+function unreadLineNode() {
+  const el = document.createElement('div')
+  el.className = 'unread-line'
+  el.textContent = seenAt ? '上次看到这里 · ' + fmtDayClock(seenAt) : '新消息'
+  return el
+}
+function placeUnreadLine() {
+  const box = $('#msgs'); if (!box) return
+  if (lineIo) { lineIo.disconnect(); lineIo = null }
+  const old = box.querySelector('.unread-line'); if (old) old.remove()
+  let first = null
+  box.querySelectorAll('.msg.her').forEach((el) => { if (!first && Number(el.dataset.t || 0) > seenAt) first = el })
+  if (!first) return
+  const node = unreadLineNode()
+  box.insertBefore(node, first)
+  lineIo = new IntersectionObserver((entries) => {
+    for (const e of entries) {
+      if (e.isIntersecting) { e.target.dataset.lineSeen = '1'; continue }
+      if (e.target.dataset.lineSeen && e.boundingClientRect.top < 0) {
+        e.target.remove(); lineIo.disconnect(); lineIo = null; break
+      }
+    }
+  })
+  lineIo.observe(node)
+}
+
+// ---------- #1 已读（B 半）：我发的消息三段态 ----------
+// 已送出 → 她收到了（received 水位，契约 §1）→ 她正在回复（typing，契约 §2）→ 她回复了（状态消失）。
+// 只渲染服务器确认的事实；30s 没等到「她收到了」只诚实标「她还没收到」，不重发（Leader 裁定）。
+const RSTAT_TEXT = { sent: '已送出', got: '她收到了', typing: '她正在回复', late: '她还没收到' }
+const RSTAT_TIMEOUT = 30000
+let receivedWm = 0        // 「她收到了」水位：SSE received.receivedAt，只向前
+let typingOffTimer = null // 极短 off→on 视为同一段「正在回复」，防闪断（契约 §2b）
+
+function clearStatTimer(el) { if (el && el._statTimer) { clearTimeout(el._statTimer); el._statTimer = null } }
+
+function setMyStat(el, key) {
+  if (!el || !el.isConnected) return
+  const meta = el.querySelector('.meta')
+  if (!meta) return
+  let span = meta.querySelector('.rstat')
+  if (!key) {
+    if (span) span.remove()
+    delete el.dataset.rstat
+    clearStatTimer(el)
+    return
+  }
+  if (!span) { span = document.createElement('span'); span.className = 'rstat'; meta.appendChild(span) }
+  span.textContent = '· ' + RSTAT_TEXT[key]
+  span.dataset.k = key
+  el.dataset.rstat = key
+}
+
+// 我的消息回显到达：亮「已送出」；30s 没等到 received → 「她还没收到」（只标，不重发）
+function onMyMessageEcho(el) {
+  setMyStat(el, 'sent')
+  clearStatTimer(el)
+  el._statTimer = setTimeout(() => {
+    el._statTimer = null
+    if (el.dataset.rstat === 'sent') setMyStat(el, 'late')
+  }, RSTAT_TIMEOUT)
+}
+
+// received 水位推进：t <= receivedAt 的我方消息 → 「她收到了」（迟到的 received 也把 late 升级回 got）
+function markMyReceived() {
+  const box = $('#msgs'); if (!box) return
+  box.querySelectorAll('.msg.me').forEach((el) => {
+    const k = el.dataset.rstat
+    if (!k || k === 'got' || k === 'typing') return
+    if (Number(el.dataset.t || 0) <= receivedWm) { clearStatTimer(el); setMyStat(el, 'got') }
+  })
+}
+
+// typing：on → 最后一条还没收束的我方消息升「她正在回复」；off → 收束（状态消失）
+function onTypingStatus(on) {
+  if (on) {
+    if (typingOffTimer) { clearTimeout(typingOffTimer); typingOffTimer = null }
+    const box = $('#msgs'); if (!box) return
+    const mine = box.querySelectorAll('.msg.me')
+    for (let i = mine.length - 1; i >= 0; i--) {
+      const k = mine[i].dataset.rstat
+      if (k === 'sent' || k === 'got' || k === 'late') { setMyStat(mine[i], 'typing'); break }
+    }
+  } else if (!typingOffTimer) {
+    typingOffTimer = setTimeout(() => {
+      typingOffTimer = null
+      const box = $('#msgs'); if (!box) return
+      box.querySelectorAll('.msg.me[data-rstat="typing"]').forEach((el) => setMyStat(el, null))
+    }, 400)
+  }
+}
+
+// 她的回复到达 = 这一轮结束：我方消息上的三段态整段消失（④ 她回复了）
+function clearMyStats() {
+  if (typingOffTimer) { clearTimeout(typingOffTimer); typingOffTimer = null }
+  const box = $('#msgs'); if (!box) return
+  box.querySelectorAll('.msg.me[data-rstat]').forEach((el) => setMyStat(el, null))
 }
 
 async function loadConfig() {
@@ -372,21 +676,34 @@ async function refreshMoodPill() {
 
 async function loadMessages() {
   // 一个分片文件 = 一页：首屏只渲染最新那片，往上翻才取上一片
+  offviewUnread = 0   // 进聊天页后未读一律以服务端水位重算，红点不再叠着算
+  readUiReady = false
   const r = await api('/api/messages?file=last')
   const box = $('#msgs')
   if (!box) return
   box.innerHTML = ''
   historyState = { oldestAt: 0, hasMore: false, loading: false, index: 0, total: 0 }
-  if (!r.ok) { box.innerHTML = '<div class="empty">读不到消息：' + esc(r.reason || '') + '</div>'; return }
+  if (!r.ok) { box.innerHTML = '<div class="empty">读不到消息：' + esc(r.reason || '') + '</div>'; refreshUnreadBadge(); return }
   const list = r.messages || []
   if (r.file) { historyState.index = Number(r.file.index) || 0; historyState.total = Number(r.file.total) || 0 }
-  if (!list.length) { box.innerHTML = '<div class="empty">还没说过话。打个招呼吧。</div>'; return }
+  if (!list.length) { box.innerHTML = '<div class="empty">还没说过话。打个招呼吧。</div>'; refreshUnreadBadge(); return }
   for (const m of list) appendMessage(m, false)
   historyState.oldestAt = r.oldestAt || (list[0] && list[0].t) || 0
   historyState.hasMore = Boolean(r.hasMore)
   renderHistoryMore()
   scrollDown()
-  refreshReadMarks()
+  // 打开聊天页这一刻取水位快照，t > 快照的她的消息标未读；分隔线也以它定位
+  await fetchReadState()
+  if (!box.isConnected || currentView !== 'chat') return
+  seenAt = myReadAt
+  box.querySelectorAll('.msg.her').forEach((el) => {
+    if (Number(el.dataset.t || 0) > seenAt) el.classList.add('unread')
+  })
+  refreshUnreadBadge()
+  watchUnread()
+  placeUnreadLine()
+  reconcileUnread()   // 视口里的立刻算读到（条件不满足就一条都不消）
+  readUiReady = true
 }
 
 // 「查看更早的记录」按钮：只在还有更早的消息时出现，位置固定在列表最上面
@@ -425,16 +742,69 @@ async function loadOlder(btn) {
     const more = box.querySelector('.more-history')
     if (more) more.remove()
     // 从后往前插到最前面，保证 DOM 顺序和原来的列表一致
-    for (let i = list.length - 1; i >= 0; i--) prependMessage(list[i])
+    let newUnread = 0
+    for (let i = list.length - 1; i >= 0; i--) {
+      const el = prependMessage(list[i])
+      // 旧分页也可能比水位新（水位停在最早那页之前），新插进来的她消息按快照补判未读
+      if (el && readUiReady && list[i].who !== 'user' && Number(list[i].t || 0) > seenAt) {
+        el.classList.add('unread')
+        if (msgIo) msgIo.observe(el)
+        newUnread++
+      }
+    }
     reflowDaySeparators()
     box.scrollTop = box.scrollHeight - keep
+    if (newUnread) { placeUnreadLine(); refreshUnreadBadge() }
   }
   renderHistoryMore()
 }
 
-function mediaUrl(m) {
-  if (!m || !m.mediaId) return ''
-  return BASE + '/api/media/' + encodeURIComponent(m.mediaId) + '?token=' + encodeURIComponent(token)
+// 媒体取回统一走 Authorization 头 + blob：URL 里不出现 token（不落日志/历史/Referer）。
+// <img>/<audio>/CSS 带不了自定义头，所以先渲染占位（data-media-id / data-sticker-md5），
+// 再用带 Bearer 的 fetch 取回 blob，把 object URL 赋给 src。blob 按 URL 缓存：
+// 切视图重渲染同一批消息时不重复下载；登出/换号统一 revoke，防对象 URL 泄漏。
+const mediaBlobCache = new Map()
+async function authedBlobUrl(url) {
+  if (mediaBlobCache.has(url)) return mediaBlobCache.get(url)
+  const r = await fetch(url, { headers: token ? { authorization: 'Bearer ' + token } : {}, cache: 'no-store' })
+  if (!r.ok) throw new Error('HTTP ' + r.status)
+  // 服务端对「没有这个资源」回 200 + JSON（ok:false），不验类型会把 JSON 塞给 <img>/<audio>
+  const type = r.headers.get('content-type') || ''
+  if (!type.startsWith('image/') && !type.startsWith('audio/')) throw new Error('HTTP ' + r.status + ' ' + type)
+  const obj = URL.createObjectURL(await r.blob())
+  mediaBlobCache.set(url, obj)
+  return obj
+}
+async function mediaBlobUrl(mediaId) { return authedBlobUrl(BASE + '/api/media/' + encodeURIComponent(mediaId)) }
+async function stickerBlobUrl(md5) { return authedBlobUrl(BASE + '/api/sticker/' + encodeURIComponent(md5)) }
+function disposeMediaBlobs() {
+  for (const u of mediaBlobCache.values()) { try { URL.revokeObjectURL(u) } catch (e) { /* 已回收就算了 */ } }
+  mediaBlobCache.clear()
+  disposeAvatarBlob()
+  disposeLocalBg()
+}
+
+function hydrateMedia(el) {
+  mediaBlobUrl(el.dataset.mediaId).then((url) => {
+    if (el.isConnected) el.src = url
+  }).catch(() => {
+    if (!el.isConnected) return
+    if (el.tagName === 'AUDIO') {
+      const bar = el.closest('.voice-bar')
+      if (bar) bar.innerHTML = '<span class="expired">语音已经过期了</span>'
+    } else {
+      el.dispatchEvent(new Event('error'))   // guardMediaImg 换占位文字
+    }
+  })
+}
+
+// 表情文件和聊天媒体同一套授权取回；img 上先不挂 src，等 blob 回来再填
+function hydrateSticker(el) {
+  stickerBlobUrl(el.dataset.stickerMd5).then((url) => {
+    if (el.isConnected) el.src = url
+  }).catch(() => {
+    if (el.isConnected) el.dispatchEvent(new Event('error'))   // guardMediaImg 换占位文字
+  })
 }
 
 // 表情消息里存的历史值有两种：裸 md5，和旧写入路径存下来的文件名（manual-<md5>.jpg）。
@@ -458,7 +828,8 @@ function guardMediaImg(img, label) {
     img.replaceWith(span)
   }
   img.addEventListener('error', swap, { once: true })
-  if (img.complete && img.naturalWidth === 0) swap()
+  // 没挂 src 的（等 blob 水合的）不算坏图，等 hydrateMedia 的结果
+  if (img.getAttribute('src') && img.complete && img.naturalWidth === 0) swap()
 }
 
 function buildMessageNode(m) {
@@ -474,23 +845,26 @@ function buildMessageNode(m) {
     inner += '<div class="quote-block">引用：' + esc(refMatch[1]) + '</div>'
   }
   if (m.kind === 'voice') {
-    const src = m.mediaId ? mediaUrl(m) : (m.voice ? 'data:' + (m.voiceMime || 'audio/mpeg') + ';base64,' + m.voice : '')
-    inner = src
+    const src = m.voice ? 'data:' + (m.voiceMime || 'audio/mpeg') + ';base64,' + m.voice : ''
+    inner = (m.mediaId || src)
       ? '<div class="voice-bar" data-vid="' + esc(m.id || '') + '">' +
         '<button class="vb-play" data-voice-play aria-label="播放"></button>' +
         '<span class="vb-bars">' + BARS + '</span>' +
         '<span class="vb-dur">' + (m.dur ? fmtDur(m.dur) : '') + '</span>' +
-        '<audio preload="metadata" src="' + src + '"></audio></div>' +
+        '<audio preload="metadata"' + (src ? ' src="' + src + '"' : ' data-media-id="' + esc(m.mediaId) + '"') + '></audio></div>' +
         (m.heard ? '<div class="heard">听成了：' + esc(m.heard) + '</div>' : '')
       : (m.heard ? '<div class="heard">听成了：' + esc(m.heard) + '</div>' : esc(m.text || '[语音已过期]'))
   } else if (m.kind === 'sticker') {
     const md5 = stickerMd5(m.sticker)
     inner += md5
-      ? '<img data-media-fallback="sticker" src="' + BASE + '/api/sticker/' + md5 + '" alt="' + esc(m.name || '表情') + '" />'
+      ? '<img data-media-fallback="sticker" data-sticker-md5="' + esc(md5) + '" alt="' + esc(m.name || '表情') + '" />'
       : '<span class="expired">表情已经不在了</span>'
   } else if (m.kind === 'image') {
-    const src = m.mediaId ? mediaUrl(m) : (m.image ? 'data:' + (m.imageMime || 'image/png') + ';base64,' + m.image : '')
-    inner += src ? '<img data-media-fallback="image" src="' + src + '" alt="图片" />' : '<span class="expired">图片已经过期了</span>'
+    inner += m.mediaId
+      ? '<img data-media-fallback="image" data-media-id="' + esc(m.mediaId) + '" alt="图片" />'
+      : (m.image
+        ? '<img data-media-fallback="image" src="data:' + (m.imageMime || 'image/png') + ';base64,' + m.image + '" alt="图片" />'
+        : '<span class="expired">图片已经过期了</span>')
   } else if (refMatch) {
     inner += esc(refMatch[2])
   } else {
@@ -498,10 +872,12 @@ function buildMessageNode(m) {
   }
   if (mine && m.kind === 'image' && cfg?.stickers?.steal !== false) inner += '<button class="collect" data-collect="' + esc(m.id || '') + '">收进表情库</button>'
   wrap.innerHTML = (mine ? '' : '<div class="sender">' + esc(bot()) + '</div>') +
-    '<div class="bubble"><div class="body">' + inner + '</div><span class="meta">' + esc(fmtDayClock(m.t)) + (mine ? '<i class="read-mark" data-r="me"></i>' : '<i class="read-mark" data-r="her"></i>') + '</span></div>'
+    '<div class="bubble"><div class="body">' + inner + '</div><span class="meta">' + esc(fmtDayClock(m.t)) + '</span></div>'
   wrap.querySelectorAll('img[data-media-fallback]').forEach((img) => {
     guardMediaImg(img, img.dataset.mediaFallback === 'sticker' ? '表情已经不在了' : '图片已经过期了')
   })
+  wrap.querySelectorAll('[data-media-id]').forEach(hydrateMedia)
+  wrap.querySelectorAll('img[data-sticker-md5]').forEach(hydrateSticker)
   wrap.addEventListener('contextmenu', (e) => showMsgMenu(e, m, wrap, refMatch))
   return wrap
 }
@@ -582,19 +958,26 @@ function reflowDaySeparators() {
   let prev = ''
   box.querySelectorAll('.msg').forEach((el) => {
     const k = dayKey(Number(el.dataset.t || 0))
-    if (k !== prev) { box.insertBefore(daySepNode(Number(el.dataset.t || 0)), el); prev = k }
+    if (k !== prev) {
+      // 未读分隔线正好卡在换天处时，日期条排它前面：日期 → 上次看到这里 → 消息
+      const ref = (el.previousElementSibling && el.previousElementSibling.classList.contains('unread-line')) ? el.previousElementSibling : el
+      box.insertBefore(daySepNode(Number(el.dataset.t || 0)), ref)
+      prev = k
+    }
   })
 }
 
 function appendMessage(m, scroll = true) {
   const box = $('#msgs')
-  if (!box) return
-  if (m?.id && box.querySelector('[data-id="' + cssId(m.id) + '"]')) return
+  if (!box) return null
+  if (m?.id && box.querySelector('[data-id="' + cssId(m.id) + '"]')) return null
   const empty = box.querySelector('.empty')
   if (empty) empty.remove()
-  box.appendChild(buildMessageNode(m))
+  const node = buildMessageNode(m)
+  box.appendChild(node)
   reflowDaySeparators()
   if (scroll) scrollDown()
+  return node
 }
 
 // 消息 id 里可能有特殊字符，塞进属性选择器前先转义
@@ -603,10 +986,12 @@ function cssId(id) { return String(id).replace(/["\\]/g, '\\$&') }
 // 往前翻页时插到「查看更早」按钮的后面（按钮永远在最上面）
 function prependMessage(m) {
   const box = $('#msgs')
-  if (!box) return
-  if (m?.id && box.querySelector('[data-id="' + cssId(m.id) + '"]')) return
+  if (!box) return null
+  if (m?.id && box.querySelector('[data-id="' + cssId(m.id) + '"]')) return null
   const more = box.querySelector('.more-history')
-  box.insertBefore(buildMessageNode(m), more ? more.nextSibling : box.firstChild)
+  const node = buildMessageNode(m)
+  box.insertBefore(node, more ? more.nextSibling : box.firstChild)
+  return node
 }
 
 function scrollDown() { const box = $('#msgs'); if (box) box.scrollTop = box.scrollHeight }
@@ -642,21 +1027,100 @@ async function sendImage(e) {
 
 function connectStream() {
   if (stream) stream.close()
-  stream = new EventSource(BASE + '/api/stream?token=' + encodeURIComponent(token))
-  stream.onmessage = (e) => {
-    let ev
-    try { ev = JSON.parse(e.data) } catch (err) { return }
-    if (ev.type === 'message') {
+  stream = openStream(onStreamEvent)
+}
+
+// SSE 不用 EventSource：它带不了 Authorization 头，会话凭证不能进 URL。
+// 改用 fetch 流 + Bearer 头自己读，断线按退避重连；返回的句柄带 close()，
+// 和原来 EventSource 的用法（logout / 重连时 close）兼容。
+function openStream(onEvent) {
+  let closed = false
+  let ctl = null
+  const handle = {
+    close() {
+      closed = true
+      try { if (ctl) ctl.abort() } catch (e) { /* 已断就不管 */ }
+    },
+  }
+  ;(async () => {
+    let wait = 1
+    while (!closed) {
+      ctl = new AbortController()
+      try {
+        const r = await fetch(BASE + '/api/stream', {
+          headers: token ? { authorization: 'Bearer ' + token } : {},
+          signal: ctl.signal,
+        })
+        if (!r.ok || !r.body) throw new Error('HTTP ' + r.status)
+        wait = 1
+        const reader = r.body.getReader()
+        const dec = new TextDecoder()
+        let buf = ''
+        for (;;) {
+          const { done, value } = await reader.read()
+          if (done) break
+          buf += dec.decode(value, { stream: true })
+          let i
+          while ((i = buf.indexOf('\n')) >= 0) {
+            const line = buf.slice(0, i).replace(/\r$/, '')
+            buf = buf.slice(i + 1)
+            if (!line.startsWith('data:')) continue   // “: ping” 心跳之类的注释帧直接略过
+            const json = line.slice(5).trim()
+            if (!json) continue
+            try {
+              const ev = JSON.parse(json)
+              if (ev && ev.type) onEvent(ev)
+            } catch (err) { /* 单条坏帧跳过 */ }
+          }
+        }
+      } catch (e) {
+        if (closed || (ctl && ctl.signal.aborted)) break
+      }
+      if (closed) break
+      try {
+        await new Promise((res, rej) => {
+          const t = setTimeout(res, wait * 1000)
+          if (ctl) ctl.signal.addEventListener('abort', () => { clearTimeout(t); rej(new Error('closed')) }, { once: true })
+        })
+      } catch (e) { break }
+      wait = Math.min(wait * 2, 15)
+    }
+  })()
+  return handle
+}
+
+function onStreamEvent(ev) {
+  if (ev.type === 'message') {
       const m = ev.message || {}
       if (m.who === 'bot') playSound('in')
       if (!ev.chatId || !me || String(ev.chatId) === String(me.subject)) {
-        if (currentView === 'chat') appendMessage(m)
+        if (currentView === 'chat') {
+          const el = appendMessage(m)
+          if (m.who === 'user') {
+            if (el) onMyMessageEcho(el)        // 我的回显 → 三段态起点（已送出）
+          } else {
+            clearMyStats()                      // 她回了 → 我方消息的三段态整段消失（④）
+            if (el) {
+              if (canAdvanceRead()) advanceReadTo(m.t)   // 聊天页且可见有焦点，append 已把它滚进视口 → 直接算读到
+              else { el.classList.add('unread'); if (msgIo) msgIo.observe(el); refreshUnreadBadge() }
+            }
+          }
+        } else if (m.who !== 'user') {
+          offviewUnread++      // 不在聊天页：DOM 不渲染，只进红点（进聊天页后按水位重算）
+          refreshUnreadBadge()
+        }
       }
     } else if (ev.type === 'typing') {
       if (currentView === 'chat') setTyping(Boolean(ev.on))
+      onTypingStatus(Boolean(ev.on))           // 她正在回复（③）：on 升级、off 收束（契约 §2）
+    } else if (ev.type === 'received') {
+      // 她收到了（契约 §1）：只向前的水位，t <= receivedAt 的我方消息置「她收到了」
+      if (!ev.chatId || !me || String(ev.chatId) === String(me.subject)) {
+        receivedWm = Math.max(receivedWm, Number(ev.receivedAt) || 0)
+        markMyReceived()
+      }
     } else if (ev.type === 'read') {
-      // D3：对端读了 → 刷新"已读"角标
-      if (currentView === 'chat') refreshReadMarks()
+      // A 半不消费：单主人场景它只可能是自己 POST 后的回声，水位以 GET api/read 为准；B 半再接
     } else if (ev.type === 'history') {
       // 服务端过期清理 / 分片边界变了：把客户端里比 droppedBefore 更早的气泡也删掉
       if (!ev.chatId || !me || String(ev.chatId) === String(me.subject)) {
@@ -665,14 +1129,15 @@ function connectStream() {
         if (before > 0 && box) {
           box.querySelectorAll('.msg[data-t]').forEach((el) => { if (Number(el.dataset.t) < before) el.remove() })
           reflowDaySeparators()
+          // 被裁掉的可能正好是分隔线的锚点：未读还在就重新定位，没未读就把线撤了
+          if (readUiReady && (box.querySelector('.unread-line') || box.querySelector('.msg.her.unread'))) placeUnreadLine()
+          refreshUnreadBadge()
           historyState.oldestAt = Math.max(historyState.oldestAt || 0, before)
         }
         if (typeof ev.hasMore === 'boolean') historyState.hasMore = ev.hasMore
         if (currentView === 'chat') renderHistoryMore()
       }
     }
-  }
-  stream.onerror = () => {}
 }
 
 async function startPcmRecording(btn) {
@@ -746,8 +1211,14 @@ function pickAudioFile() {
   inp.click()
 }
 
-function openInBrowser() {
-  const url = location.origin + location.pathname + '?token=' + encodeURIComponent(token || '')
+async function openInBrowser() {
+  // 会话凭证不进地址栏：先换一张 60 秒一次性桥接票，新窗口用它换回自己的会话；
+  // 地址栏/历史/Referer 里只有那张短命票，没有长期 token
+  let q = ''
+  const r = await api('/api/bridge', { method: 'POST' })
+  if (r.ok && r.ticket) q = '?bridge=' + encodeURIComponent(r.ticket)
+  else toast('没拿到桥接票（' + (r.reason || '未知原因') + '），新窗口要重新登录', 'err')
+  const url = location.origin + location.pathname + q
   let w = null
   try { w = window.open(url, '_blank') } catch (e) {}
   if (!w && navigator.clipboard) {
@@ -807,9 +1278,9 @@ async function openStickerPicker(anchor) {
       '<button class="btn-sm" id="go-sticker-settings">去设置里传几张</button></div>'
   } else {
     box.innerHTML = items.map((i) => '<button class="sticker-opt" data-md5="' + esc(i.md5) + '" title="' + esc(i.name || '还没起名') + '">' +
-      '<img src="' + BASE + '/api/sticker/' + esc(i.md5) + '" alt="" />' +
+      '<img data-sticker-md5="' + esc(i.md5) + '" alt="" />' +
       (i.name ? '<i class="sticker-opt-name">' + esc(i.name) + '</i>' : '') + '</button>').join('')
-    box.querySelectorAll('.sticker-opt img').forEach((img) => guardMediaImg(img, '图没了'))
+    box.querySelectorAll('.sticker-opt img').forEach((img) => { guardMediaImg(img, '图没了'); hydrateSticker(img) })
   }
   box.style.visibility = 'hidden'
   box.style.left = '0px'
@@ -851,14 +1322,18 @@ document.addEventListener('click', async (e) => {
   const img = b.closest('.bubble')?.querySelector('img')
   if (!img) return
   const src = img.getAttribute('src') || ''
-  const data = await imageBase64(src)
+  const data = await imageBase64(src, img)
   if (!data) return toast('这张图存不下来', 'err')
   const r = await api('/api/stickers/upload', { method: 'POST', body: { data, from: 'steal', hint: '' } })
   toast(r.ok ? '收进表情库了' : (r.reason || '没收成'), r.ok ? '' : 'err')
 })
 
-// 图片可能是内联 data:，也可能是 /api/media/... 的地址，统一转成 base64 再传
-async function imageBase64(src) {
+// 图片可能是内联 data:、blob:（已授权取回的媒体），也可能是还没水合的媒体占位——
+// 占位时按 data-media-id 走授权通道取回，统一转成 base64 再传
+async function imageBase64(src, el) {
+  if ((!src || src === '') && el && el.dataset && el.dataset.mediaId) {
+    try { src = await mediaBlobUrl(el.dataset.mediaId) } catch { return '' }
+  }
   if (!src) return ''
   if (src.startsWith('data:')) { const i = src.indexOf(','); return i >= 0 ? src.slice(i + 1) : '' }
   try {
@@ -1041,7 +1516,7 @@ async function loadMemory() {
       }
       const a = e.target.closest('#prof-add')
       if (a) {
-        inlineEditor(body.querySelector('.mem-head'), '', '这个人的 ID（主人写 owner，客人写他的用户名）', async (who) => {
+        inlineEditor(body.querySelector('.mem-head'), '', '这个人的 ID（主人写 owner，其他写对方用户名）', async (who) => {
           if (!who) return
           inlineEditor(body.querySelector('.mem-head'), '', '怎么称呼 Ta / 名字', async (name) => {
             inlineEditor(body.querySelector('.mem-head'), '', '写点你对 ' + (name || who) + ' 的印象', async (text) => {
@@ -1155,7 +1630,6 @@ function renderSettings(main) {
         sectionSpeakUp(),
         sectionSelfDrive(),
         sectionWeb(),
-        sectionGuests(),
         sectionDebug(),
         sectionAccount(),
       ]
@@ -1219,6 +1693,7 @@ async function logout() {
   setToken('')
   me = null
   if (stream) { stream.close(); stream = null }
+  disposeMediaBlobs()   // 上一账号的媒体/头像/背景 object URL 全部回收
   showGate('login')
 }
 
@@ -1592,16 +2067,6 @@ function sectionSelfDrive() {
     '</div></div>'
 }
 
-function sectionGuests() {
-  return '<div class="section"><h3>客人</h3><div class="body">' +
-    '<div class="row"><label>创建客人</label><div class="ctl">' +
-    '<input type="text" id="g-u" placeholder="用户名（区分大小写）" style="max-width:190px" />' +
-    '<input type="text" id="g-d" placeholder="称呼" style="max-width:100px" />' +
-    '<select id="g-level"><option value="social">只聊天日记</option><option value="full">完全权限</option></select>' +
-    '<button class="primary small" id="g-create">创建</button></div></div>' +
-    '<div id="guest-list"></div></div></div>'
-}
-
 function sectionAccount() {
   return '<div class="section"><h3>账号</h3><div class="body">' +
     '<div class="row"><label>修改当前账户密码</label><div class="ctl">' +
@@ -1720,7 +2185,6 @@ function bindSectionEvents(box) {
     }
   }
   loadStickerGrid()
-  loadGuests()
   loadSelfDriveText()
   loadEdgeState()
   loadAsrState()
@@ -1889,10 +2353,10 @@ async function loadStickerGrid() {
   const r = await api('/api/stickers')
   const items = (r.ok && r.items) || []
   if (!items.length) { grid.innerHTML = '<div class="muted" style="font-size:12px">还没有表情。上传几张，或者看到别人发的图点「收进表情库」。</div>'; return }
-  grid.innerHTML = items.map((i) => '<div class="sticker-item"><img src="' + BASE + '/api/sticker/' + esc(i.md5) + '" alt="" />' +
+  grid.innerHTML = items.map((i) => '<div class="sticker-item"><img data-sticker-md5="' + esc(i.md5) + '" alt="" />' +
     '<div class="sticker-name">' + esc(i.name || '没起名') + '</div>' +
     '<div class="sticker-acts"><button data-rename="' + esc(i.md5) + '">改名</button><button data-del-sticker="' + esc(i.md5) + '">删除</button></div></div>').join('')
-  grid.querySelectorAll('.sticker-item img').forEach((img) => guardMediaImg(img, '图没了'))
+  grid.querySelectorAll('.sticker-item img').forEach((img) => { guardMediaImg(img, '图没了'); hydrateSticker(img) })
   grid.onclick = async (e) => {
     const rn = e.target.closest('[data-rename]')
     if (rn) {
@@ -1932,55 +2396,6 @@ function inlineEditor(host, value, placeholder, onSave) {
     await onSave(v)
   }
   input.onkeydown = (e) => { if (e.key === 'Enter') box.querySelector('.primary').click(); if (e.key === 'Escape') close() }
-}
-
-async function loadGuests() {
-  const box = $('#guest-list')
-  if (!box) return
-  const create = $('#g-create')
-  if (create) create.onclick = async () => {
-    const username = ($('#g-u')?.value || '').trim()
-    if (!username) return toast('先填个用户名', 'err')
-    const r2 = await api('/api/guests', { method: 'POST', body: { username, displayName: ($('#g-d')?.value || '').trim() || username, level: $('#g-level')?.value || 'social' } })
-    if (r2.ok) {
-      toast('创建好了，一次性密码：' + r2.password)
-      if (navigator.clipboard) navigator.clipboard.writeText(r2.password).catch(() => {})
-      if ($('#g-u')) $('#g-u').value = ''
-      if ($('#g-d')) $('#g-d').value = ''
-      loadGuests()
-    } else toast(r2.reason || '没建成', 'err')
-  }
-  const r = await api('/api/guests')
-  const list = (r.ok && r.guests) || []
-  if (!list.length) { box.innerHTML = '<div class="muted" style="font-size:12px;margin-top:8px">还没有客人。</div>'; return }
-  box.innerHTML = list.map((g) => '<div class="guest-row"><span class="g-name">' + esc(g.displayName || g.username) + '</span>' +
-    '<span class="muted" style="font-size:12px">@' + esc(g.username) + '</span>' +
-    '<span class="spacer"></span>' +
-    '<select data-glevel="' + esc(g.subject) + '"><option value="social"' + (g.level === 'social' ? ' selected' : '') + '>只聊天日记</option><option value="full"' + (g.level === 'full' ? ' selected' : '') + '>完全权限</option></select>' +
-    '<button class="ghost small" data-gpw="' + esc(g.subject) + '">重置密码</button>' +
-    '<button class="danger small" data-gdel="' + esc(g.subject) + '">删除</button></div>').join('')
-  box.onclick = async (e) => {
-    const gp = e.target.closest('[data-gpw]')
-    if (gp) {
-      inlineEditor(gp.closest('.guest-row'), '', '新密码（至少 6 位）', async (pw) => {
-        if (!pw) return
-        const r2 = await api('/api/guests/' + gp.dataset.gpw, { method: 'PATCH', body: { password: pw } })
-        toast(r2.ok ? '密码换了' : (r2.reason || '没换'), r2.ok ? '' : 'err')
-      })
-      return
-    }
-    const gd = e.target.closest('[data-gdel]')
-    if (gd) {
-      const r2 = await api('/api/guests/' + gd.dataset.gdel, { method: 'DELETE' })
-      toast(r2.ok ? '删了' : (r2.reason || '没删掉'), r2.ok ? '' : 'err'); loadGuests()
-    }
-  }
-  box.onchange = async (e) => {
-    const sel = e.target.closest('[data-glevel]')
-    if (!sel) return
-    const r2 = await api('/api/guests/' + sel.dataset.glevel, { method: 'PATCH', body: { level: sel.value } })
-    toast(r2.ok ? '改好了' : (r2.reason || '没改成'), r2.ok ? '' : 'err')
-  }
 }
 
 async function loadSelfDriveText() {
@@ -2062,30 +2477,96 @@ function applyFavicon() {
   if (el) el.href = BASE + '/icon.svg'
 }
 
+// 本地背景图也走授权取回（服务端 /api/background 已要求登录），主题层通过 refs.fetchLocalBg 拿 object URL
+let localBgBlob = null
+async function fetchLocalBg() {
+  try {
+    const r = await fetch(BASE + '/api/background?v=' + Date.now(), {
+      headers: token ? { authorization: 'Bearer ' + token } : {},
+      cache: 'no-store',
+    })
+    if (!r.ok) throw new Error('HTTP ' + r.status)
+    if (!(r.headers.get('content-type') || '').startsWith('image/')) throw new Error('not an image')
+    const u = URL.createObjectURL(await r.blob())
+    disposeLocalBg()
+    localBgBlob = u
+    return u
+  } catch (e) { return null }   // 没登录/没设背景：主题层保持无图
+}
+function disposeLocalBg() {
+  if (localBgBlob) { try { URL.revokeObjectURL(localBgBlob) } catch (e) { /* 已回收就算了 */ } localBgBlob = null }
+}
+
 async function boot({ silent = false } = {}) {
-  const deep = queryOf('token')
-  if (deep) localStorage.setItem(TOKEN_KEY, deep)
+  // 桥接票一次性换回会话，然后立刻把票从地址栏抹掉（不进历史/不进 Referer）
+  const bridge = queryOf('bridge')
+  if (bridge) {
+    const r = await api('/api/bridge/use', { method: 'POST', body: { ticket: bridge } })
+    try {
+      const u = new URL(location.href)
+      u.searchParams.delete('bridge')
+      history.replaceState(null, '', u.origin + u.pathname + (u.searchParams.toString() ? '?' + u.searchParams.toString() : ''))
+    } catch (e) { /* 地址栏抹不掉也不影响功能 */ }
+    if (r.ok && r.token) setToken(r.token)
+    else toast(r.reason || '桥接票无效，请重新登录', 'err')
+  }
+  // 旧版深链把长期 token 放在 ?token= 里，现在一律不认：只把残留参数从地址栏清掉
+  try {
+    const u = new URL(location.href)
+    if (u.searchParams.has('token')) {
+      u.searchParams.delete('token')
+      history.replaceState(null, '', u.origin + u.pathname + (u.searchParams.toString() ? '?' + u.searchParams.toString() : ''))
+    }
+  } catch (e) { }
   botState = await api('/api/state')
-  if (!botState.ok) { showGate('login', '连不上服务'); return }
+  // t32：state 401（显式凭证已失效）也走到这里——api() 已清 token，展示服务端真实原因，
+  // 别把「登录过期」误报成「连不上服务」；两条路都回登录页
+  if (!botState.ok) { showGate('login', botState.reason || '连不上服务'); return }
   me = botState.me
   applyTheme()
   applyTitle()
   applyFavicon()
-  setAvatar($('#gate-logo'), false)
-  if (botState.needSetup) { showGate('setup'); initWizard(); return }
-  if (!me) { showGate('login'); bindLogin(); return }
-  await enterApp()
-  const view = queryOf('view')
-  if (view && NAVS.some((n) => n.id === view)) switchView(view)
-  if (!silent) toast('欢迎回来' + (me.role === 'owner' ? '，' + (cfg?.ownerName || '主人') : me.name ? '，' + me.name : ''))
+  setAvatar($('#gate-logo'), iconSrc())
+  // 会话内重入（设置保存后刷新等）：只认账号会话——重走 v2 角色分流回主界面；
+  // 旧账号会话不再静默进入，清凭据回登录（t18 MED-003）
+  if (silent && me) {
+    if (me.role === 'account' || me.role === 'owner') { await routeAfterAccountAuth(); return }
+    setToken('')
+    me = null
+  }
+  // 记住我：本地还留着凭据就直接进主界面（凭据失效时 routeAfterAccountAuth 会清掉并回登录页）
+  if (token && me) { await routeAfterAccountAuth(); return }
+  // 登录优先（t13 合同）：冷启动一律先到登录/注册页；
+  // 本地是否已有旧 owner / setupDone / 历史角色都不改变该入口，needSetup 只作旧版本机初始化的显式链接提示
+  showGate('login')
+  bindLogin()
 }
+
+let loginMode = 'account'
 
 function bindLogin() {
   const form = $('#gate-form')
   form.onsubmit = async (e) => {
     e.preventDefault()
-    await doLogin($('#g-username').value.trim(), $('#g-password').value)
+    await doLogin($('#g-username').value.trim(), $('#g-password').value, loginMode)
   }
+  const tog = $('#link-toggle')
+  if (tog) tog.onclick = (e) => {
+    e.preventDefault()
+    loginMode = 'account'
+    if (tog.dataset.to === 'register') { bindRegister(); showGate('register') }
+    else showGate('login')
+  }
+  const leg = $('#link-legacy')
+  if (leg) leg.onclick = (e) => {
+    e.preventDefault()
+    if (loginMode === 'legacy') { loginMode = 'account'; showGate('login') }
+    else { loginMode = 'legacy'; showGate('legacy') }
+  }
+  const wlink = $('#link-wizard')
+  if (wlink) wlink.onclick = (e) => { e.preventDefault(); showGate('setup'); initWizard() }
+  bindRegister()
+  bindCompanionCreate()
 }
 
 document.addEventListener('input', (e) => {
@@ -2097,3 +2578,70 @@ document.addEventListener('input', (e) => {
 })
 
 boot()
+
+// ---- 心情与生命状态（合并页） ----
+async function renderMoodAndLife(main) {
+  paneShell(main, '心情与生命状态', '')
+  const body = document.getElementById('pane-body')
+  if (!body) return
+  body.innerHTML = '<div id="mood-box"><div class="loading">加载中…</div></div>' +
+    '<div id="life-box"><div class="loading">加载中…</div></div>'
+  await views.mood.renderMoodInto(document.getElementById('mood-box'))
+  await renderLife(document.getElementById('life-box'))
+}
+
+async function renderLife(box) {
+  if (!box) return
+  box.innerHTML = '<div class="loading">加载中…</div>'
+
+  const r = await api('/api/life/state')
+  if (!r || !r.ok) {
+    box.innerHTML = '<div class="empty">获取生命状态失败：' + esc((r && r.reason) || '未知错误') + '</div>'
+    return
+  }
+
+  const s = r.state || {}
+  const h = r.hormones || {}
+
+  const pct = (v) => Math.round(Math.max(0, Math.min(100, v || 0)))
+  const bar = (v, color) => `<div style="background:#2a2a2a;border-radius:4px;height:8px;width:100%;margin:4px 0">
+    <div style="background:${color};border-radius:4px;height:8px;width:${pct(v)}%"></div></div>`
+
+  box.innerHTML = `
+    <div class="pane-section" style="padding:16px">
+      <h3 style="margin:0 0 16px">身体状态</h3>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+        <div><div style="color:#aaa;font-size:12px">精力</div>${bar(s.energy,'#4caf50')}<div style="font-size:12px">${pct(s.energy)}%</div></div>
+        <div><div style="color:#aaa;font-size:12px">饥饿</div>${bar(s.hunger,'#ff9800')}<div style="font-size:12px">${pct(s.hunger)}%</div></div>
+        <div><div style="color:#aaa;font-size:12px">口渴</div>${bar(s.thirst,'#2196f3')}<div style="font-size:12px">${pct(s.thirst)}%</div></div>
+        <div><div style="color:#aaa;font-size:12px">困倦</div>${bar(s.sleepiness,'#9c27b0')}<div style="font-size:12px">${pct(s.sleepiness)}%</div></div>
+      </div>
+
+      <h3 style="margin:20px 0 16px">给她来点什么</h3>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button class="primary small" onclick="lifeEvent('drink')">喝水</button>
+        <button class="primary small" onclick="lifeEvent('eat')">吃东西</button>
+        <button class="primary small" onclick="lifeEvent('comfort')">安慰她</button>
+        <button class="primary small" onclick="lifeEvent('nudge')">戳一戳</button>
+        <button class="ghost small" onclick="refreshLife()">刷新</button>
+      </div>
+      <div id="life-msg" style="margin-top:12px;font-size:13px;color:#aaa"></div>
+    </div>`
+}
+
+async function refreshLife() {
+  await renderLife(document.getElementById('life-box'))
+}
+
+async function lifeEvent(type) {
+  const msg = document.getElementById('life-msg')
+  if (msg) msg.textContent = '发送中…'
+  const r = await api('/api/life/event', { method: 'POST', body: { type } })
+  if (msg) msg.textContent = r && r.ok ? ('✓ ' + (r.message || '好的')) : ('✗ ' + ((r && r.reason) || '失败了'))
+  setTimeout(() => refreshLife(), 1200)
+}
+
+// 内联 onclick 只能看见 window 上的东西：ES module 里的函数默认不在 window，
+// 少了这两行，生命状态面板的按钮点了就是 ReferenceError。
+window.lifeEvent = lifeEvent
+window.refreshLife = refreshLife

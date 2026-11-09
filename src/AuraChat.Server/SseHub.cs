@@ -8,8 +8,8 @@ using Microsoft.AspNetCore.Http;
 namespace AuraChat.Server;
 
 /// <summary>
-/// SSE 广播：网页端/桌面端/手机端都通过 GET api/stream?token= 连上来，
-/// 服务端用 Emit(type, payload) 推送（对齐原 server.js 的 emit，按 chatId 过滤）。
+/// SSE 广播：网页端/桌面端通过 GET api/stream 连上来，凭证走 Authorization 头
+/// （旧版 URL ?token= 只是有界兼容兜底），服务端用 Emit(type, payload) 推送（对齐原 server.js 的 emit，按 chatId 过滤）。
 /// </summary>
 public sealed class SseHub(AppLog log) : ISseEmitter, IAsyncDisposable
 {

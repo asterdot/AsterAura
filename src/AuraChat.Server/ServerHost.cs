@@ -136,7 +136,10 @@ public sealed class ServerHost(ApiContext api, AppLog log) : IAsyncDisposable
         catch (Exception ex)
         {
             _log.Warn($"请求出错 {ctx.Request.Path}：{ex.Message}");
-            try { await HttpUtil.JsonAsync(ctx, new JsonObject { ["ok"] = false, ["message"] = ex.Message }); } catch { }
+            // 错误响应也用恰当状态码：处理器若已自行写过 401/403/404 等状态码就保留，
+            // 否则（默认 200）归为 500。响应体结构不变（ok=false + message）。
+            var status = ctx.Response.StatusCode == 200 ? 500 : ctx.Response.StatusCode;
+            try { await HttpUtil.JsonAsync(ctx, status, new JsonObject { ["ok"] = false, ["message"] = ex.Message }); } catch { }
         }
     }
 
@@ -157,7 +160,9 @@ public sealed class ServerHost(ApiContext api, AppLog log) : IAsyncDisposable
         catch (Exception ex)
         {
             _log.Warn($"接口 {p} 出错：{ex.Message}");
-            try { await HttpUtil.JsonAsync(ctx, new JsonObject { ["ok"] = false, ["message"] = ex.Message }); } catch { }
+            // 接口存在但内部出错 = 500；若处理器已自行写过 401/403/404 则保留原状态码。
+            var status = ctx.Response.StatusCode == 200 ? 500 : ctx.Response.StatusCode;
+            try { await HttpUtil.JsonAsync(ctx, status, new JsonObject { ["ok"] = false, ["message"] = ex.Message }); } catch { }
         }
     }
 
